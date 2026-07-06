@@ -1,0 +1,29 @@
+name: GA4 to Google Sheets
+
+on:
+  workflow_dispatch
+ 
+
+jobs:
+  ga4-to-sheets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run GA4 script
+        env:
+          GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          HOME_SCREEN_NAME: ${{ secrets.HOME_SCREEN_NAME }}
+        run: python ga4_to_sheets.py
