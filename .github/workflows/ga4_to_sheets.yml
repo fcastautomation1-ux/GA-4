@@ -1,8 +1,20 @@
 name: GA4 to Google Sheets
 
 on:
-  workflow_dispatch
- 
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name"
+        required: true
+      property_id:
+        description: "GA4 Property ID"
+        required: true
+      home_screen_name:
+        description: "Home screen name/class"
+        required: true
+
+  schedule:
+    - cron: "0 4 * * *"
 
 jobs:
   ga4-to-sheets:
@@ -24,6 +36,10 @@ jobs:
         env:
           GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
-          HOME_SCREEN_NAME: ${{ secrets.HOME_SCREEN_NAME }}
+
+          APP_NAME: ${{ github.event.inputs.app_name || vars.APP_NAME }}
+          GA4_PROPERTY_ID: ${{ github.event.inputs.property_id || vars.GA4_PROPERTY_ID }}
+          HOME_SCREEN_NAME: ${{ github.event.inputs.home_screen_name || vars.HOME_SCREEN_NAME }}
+
+          SCREEN_FIELD: unifiedPagePathScreen
         run: python ga4_to_sheets.py
