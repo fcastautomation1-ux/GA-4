@@ -28,36 +28,34 @@ def optional_env(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    app_name: str
-    property_id: str
     spreadsheet_id: str
     service_account_json: str
 
-    sheet_name: str
+    apps_config_sheet: str
+    summary_sheet: str
+    details_sheet: str
+
     start_date: str
     end_date: str
-
-    home_screen_name: str
-    screen_field: str
     timezone: str
+
+    default_home_screen_name: str
+    default_screen_field: str
 
 
 def load_config() -> Config:
     return Config(
-        app_name=required_env("APP_NAME"),
-        property_id=required_env("GA4_PROPERTY_ID"),
         spreadsheet_id=required_env("SPREADSHEET_ID"),
         service_account_json=required_env("GA4_SERVICE_ACCOUNT_JSON"),
 
-        sheet_name=optional_env("SHEET_NAME", "GA4 Basic Funnel"),
-        start_date=optional_env("START_DATE", "30daysAgo"),
-        end_date=optional_env("END_DATE", "today"),
+        apps_config_sheet=optional_env("APPS_CONFIG_SHEET", "Apps Config"),
+        summary_sheet=optional_env("SUMMARY_SHEET", "GA4 Funnel Summary"),
+        details_sheet=optional_env("DETAILS_SHEET", "GA4 Funnel Details"),
 
-        home_screen_name=required_env("HOME_SCREEN_NAME"),
-
-        # Your GA4 report showed: Page path and screen class = MainActivity
-        # API field for this is unifiedPagePathScreen
-        screen_field=optional_env("SCREEN_FIELD", "unifiedPagePathScreen"),
-
+        start_date=optional_env("START_DATE", "28daysAgo"),
+        end_date=optional_env("END_DATE", "yesterday"),
         timezone=optional_env("TIMEZONE", "Asia/Karachi"),
+
+        default_home_screen_name=optional_env("DEFAULT_HOME_SCREEN_NAME", "MainActivity"),
+        default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
     )
