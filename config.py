@@ -26,6 +26,15 @@ def optional_env(name: str, default: str) -> str:
     return str(value).strip()
 
 
+def optional_int_env(name: str, default: int) -> int:
+    value = optional_env(name, str(default))
+
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a number. Current value: {value}")
+
+
 @dataclass(frozen=True)
 class Config:
     spreadsheet_id: str
@@ -34,6 +43,8 @@ class Config:
     apps_config_sheet: str
     summary_sheet: str
     details_sheet: str
+    user_session_sheet: str
+    retention_details_sheet: str
 
     start_date: str
     end_date: str
@@ -41,6 +52,8 @@ class Config:
 
     default_home_screen_name: str
     default_screen_field: str
+
+    retention_days: int
 
 
 def load_config() -> Config:
@@ -51,6 +64,8 @@ def load_config() -> Config:
         apps_config_sheet=optional_env("APPS_CONFIG_SHEET", "Apps Config"),
         summary_sheet=optional_env("SUMMARY_SHEET", "GA4 Funnel Summary"),
         details_sheet=optional_env("DETAILS_SHEET", "GA4 Funnel Details"),
+        user_session_sheet=optional_env("USER_SESSION_SHEET", "GA4 User Session Summary"),
+        retention_details_sheet=optional_env("RETENTION_DETAILS_SHEET", "GA4 Retention Details"),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
         end_date=optional_env("END_DATE", "yesterday"),
@@ -58,4 +73,6 @@ def load_config() -> Config:
 
         default_home_screen_name=optional_env("DEFAULT_HOME_SCREEN_NAME", "MainActivity"),
         default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
+
+        retention_days=optional_int_env("RETENTION_DAYS", 7),
     )
