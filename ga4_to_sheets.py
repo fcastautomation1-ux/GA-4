@@ -28,6 +28,8 @@ from google.analytics.data_v1beta.types import (
     Cohort,
     CohortSpec,
     CohortsRange,
+    Filter,
+    FilterExpression,
 )
 
 from googleapiclient.discovery import build
@@ -241,6 +243,34 @@ def get_report_date_range_display() -> str:
     end = resolve_ga4_date(config.end_date)
 
     return f"{start} to {end}"
+
+
+def get_report_dates() -> list[str]:
+    start_date = datetime.fromisoformat(
+        resolve_ga4_date(config.start_date)
+    ).date()
+
+    end_date = datetime.fromisoformat(
+        resolve_ga4_date(config.end_date)
+    ).date()
+
+    dates = []
+    current_date = start_date
+
+    while current_date <= end_date:
+        dates.append(current_date.isoformat())
+        current_date += timedelta(days=1)
+
+    return dates
+
+
+def format_ga4_date(value: str) -> str:
+    value = str(value).strip()
+
+    if re.fullmatch(r"\d{8}", value):
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+
+    return value
 
 
 def get_retention_cohort_date_range() -> tuple[str, str]:
@@ -788,6 +818,161 @@ def parse_retention_report(app: AppConfig, response):
     return summary, detail_rows
 
 
+# =========================
+# DAILY NOTIFICATIONS REPORT
+# =========================
+
+
+def get_notification_events() -> list[str]:
+    return [
+        event.strip()
+        for event in config.notification_events.split(",")
+        if event.strip()
+    ]
+
+
+def run_daily_notifications_report(app: AppConfig):
+    notification_events = get_notification_events()
+
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        dimensions=[
+            Dimension(name="date"),
+            Dimension(name="eventName"),
+        ],
+        metrics=[
+            Metric(name="eventCount"),
+            Metric(name="activeUsers"),
+        ],
+        dimension_filter=FilterExpression(
+            filter=Filter(
+                field_name="eventName",
+                in_list_filter=Filter.InListFilter(
+                    values=notification_events,
+                    case_sensitive=False,
+                ),
+            )
+        ),
+        keep_empty_rows=False,
+    )
+
+    return beta_client.run_report(request)
+
+
+def parse_daily_notifications_report(app: AppConfig, response):
+    notification_events = get_notification_events()
+    report_dates = get_report_dates()
+    updated_at = now_text()
+
+    counts_by_date = {
+        report_date: {
+            event_name: 0 for event_name in notification_events
+        }
+        for report_date in report_dates
+    }
+
+    users_by_date = {
+        report_date: {
+            event_name: 0 for event_name in notification_events
+        }
+        for report_date in report_dates
+    }
+
+    dimension_headers = [
+        header.name for header in response.dimension_headers
+    ]
+
+    metric_headers = [
+        header.name for header in response.metric_headers
+    ]
+
+    for row in response.rows:
+        row_data = {}
+
+        for index, dimension_value in enumerate(row.dimension_values):
+            row_data[dimension_headers[index]] = dimension_value.value
+
+        for index, metric_value in enumerate(row.metric_values):
+            row_data[metric_headers[index]] = metric_value.value
+
+        report_date = format_ga4_date(row_data.get("date", ""))
+        event_name = row_data.get("eventName", "")
+
+        event_count = to_number(row_data.get("eventCount", 0))
+        active_users = to_number(row_data.get("activeUsers", 0))
+
+        if report_date not in counts_by_date:
+            counts_by_date[report_date] = {
+                event: 0 for event in notification_events
+            }
+            users_by_date[report_date] = {
+                event: 0 for event in notification_events
+            }
+
+        counts_by_date[report_date][event_name] = event_count
+        users_by_date[report_date][event_name] = active_users
+
+    rows = []
+
+    for report_date in report_dates:
+        received_count = counts_by_date[report_date].get("notification_receive", 0)
+        opened_count = counts_by_date[report_date].get("notification_open", 0)
+        foreground_count = counts_by_date[report_date].get("notification_foreground", 0)
+        dismissed_count = counts_by_date[report_date].get("notification_dismiss", 0)
+
+        receive_users = users_by_date[report_date].get("notification_receive", 0)
+        open_users = users_by_date[report_date].get("notification_open", 0)
+        foreground_users = users_by_date[report_date].get("notification_foreground", 0)
+        dismiss_users = users_by_date[report_date].get("notification_dismiss", 0)
+
+        total_notification_events = (
+            received_count
+            + opened_count
+            + foreground_count
+            + dismissed_count
+        )
+
+        if total_notification_events > 0:
+            status = "SUCCESS"
+            error_message = ""
+        else:
+            status = "NO NOTIFICATION DATA"
+            error_message = "No notification events found for this app on this date."
+
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date,
+                received_count,
+                opened_count,
+                foreground_count,
+                dismissed_count,
+                make_rate(opened_count, received_count),
+                receive_users,
+                open_users,
+                foreground_users,
+                dismiss_users,
+                status,
+                error_message,
+                updated_at,
+            ]
+        )
+
+    return rows
+
+
+# =========================
+# EMPTY / ERROR HELPERS
+# =========================
+
+
 def empty_session_data() -> dict:
     return {
         "active_users": "",
@@ -841,6 +1026,21 @@ def append_error_retention_detail(
             now_text(),
         ]
     )
+
+
+def get_final_status(errors: list[str], status_priority: list[str]) -> tuple[str, str]:
+    if not errors:
+        return "SUCCESS", ""
+
+    error_text = " | ".join(errors)
+
+    if "NO ACCESS" in status_priority:
+        return "NO ACCESS", error_text
+
+    if "INVALID PROPERTY ID" in status_priority:
+        return "INVALID PROPERTY ID", error_text
+
+    return "ERROR", error_text
 
 
 # =========================
@@ -930,6 +1130,26 @@ def main():
             "Cohort Active Users",
             "Cohort Total Users",
             "Retention Rate",
+            "Status",
+            "Error",
+            "Updated At",
+        ]
+    ]
+
+    notification_daily_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Date",
+            "Notification Received",
+            "Notification Opened",
+            "Notification Foreground",
+            "Notification Dismissed",
+            "Notification Open Rate",
+            "Receive Active Users",
+            "Open Active Users",
+            "Foreground Active Users",
+            "Dismiss Active Users",
             "Status",
             "Error",
             "Updated At",
@@ -1034,18 +1254,10 @@ def main():
                 error_text=error_text,
             )
 
-        if not errors:
-            user_session_status = "SUCCESS"
-            user_session_error = ""
-        elif "NO ACCESS" in status_priority:
-            user_session_status = "NO ACCESS"
-            user_session_error = " | ".join(errors)
-        elif "INVALID PROPERTY ID" in status_priority:
-            user_session_status = "INVALID PROPERTY ID"
-            user_session_error = " | ".join(errors)
-        else:
-            user_session_status = "ERROR"
-            user_session_error = " | ".join(errors)
+        user_session_status, user_session_error = get_final_status(
+            errors,
+            status_priority,
+        )
 
         updated_at = now_text()
 
@@ -1076,16 +1288,54 @@ def main():
             ]
         )
 
+        # Daily notifications
+        try:
+            notification_response = run_daily_notifications_report(app)
+            app_notification_rows = parse_daily_notifications_report(
+                app,
+                notification_response,
+            )
+
+            notification_daily_rows.extend(app_notification_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            updated_at = now_text()
+
+            print(f"NOTIFICATION {status} for {app.app_name}: {error_text}")
+
+            notification_daily_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    updated_at,
+                ]
+            )
+
     write_sheet(config.summary_sheet, funnel_summary_rows)
     write_sheet(config.details_sheet, funnel_details_rows)
     write_sheet(config.user_session_sheet, user_session_rows)
     write_sheet(config.retention_details_sheet, retention_details_rows)
+    write_sheet(config.notification_daily_sheet, notification_daily_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
     print(f"Funnel Details: {config.details_sheet}")
     print(f"User Session Summary: {config.user_session_sheet}")
     print(f"Retention Details: {config.retention_details_sheet}")
+    print(f"Daily Notifications: {config.notification_daily_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
