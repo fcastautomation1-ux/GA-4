@@ -38,7 +38,11 @@ jobs:
           RETENTION_DETAILS_SHEET: GA4 Retention Details
           AUDIENCE_SEGMENTS_SHEET: GA4 Audience Segments
           PERSONALIZED_UX_SHEET: GA4 Personalized User Experience
-          UX_REPORT_LIMIT: ${{ vars.UX_REPORT_LIMIT || '10' }}
+          REMOTE_CONFIG_SHEET: GA4 Remote Configuration
+
+          PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
+          REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
+          REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '10' }}
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
           DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
