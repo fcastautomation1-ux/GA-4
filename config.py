@@ -47,6 +47,7 @@ class Config:
     retention_details_sheet: str
     audience_segments_sheet: str
     personalized_ux_sheet: str
+    remote_config_sheet: str
 
     start_date: str
     end_date: str
@@ -56,7 +57,9 @@ class Config:
     default_screen_field: str
 
     retention_days: int
-    ux_report_limit: int
+    personalized_top_n: int
+    remote_config_event_limit: int
+    remote_config_app_version_limit: int
 
 
 def load_config() -> Config:
@@ -83,6 +86,10 @@ def load_config() -> Config:
             "PERSONALIZED_UX_SHEET",
             "GA4 Personalized User Experience",
         ),
+        remote_config_sheet=optional_env(
+            "REMOTE_CONFIG_SHEET",
+            "GA4 Remote Configuration",
+        ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
         end_date=optional_env("END_DATE", "yesterday"),
@@ -98,5 +105,10 @@ def load_config() -> Config:
         ),
 
         retention_days=optional_int_env("RETENTION_DAYS", 7),
-        ux_report_limit=optional_int_env("UX_REPORT_LIMIT", 10),
+        personalized_top_n=optional_int_env("PERSONALIZED_TOP_N", 10),
+        remote_config_event_limit=optional_int_env("REMOTE_CONFIG_EVENT_LIMIT", 25),
+        remote_config_app_version_limit=optional_int_env(
+            "REMOTE_CONFIG_APP_VERSION_LIMIT",
+            10,
+        ),
     )
