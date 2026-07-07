@@ -654,6 +654,7 @@ def run_retention_report(app: AppConfig):
             cohorts=[
                 Cohort(
                     name="Acquired Users",
+                    dimension="firstSessionDate",
                     date_range=BetaDateRange(
                         start_date=cohort_start,
                         end_date=cohort_end,
