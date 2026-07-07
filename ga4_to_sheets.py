@@ -1025,6 +1025,356 @@ def build_audience_segment_rows_for_app(app: AppConfig) -> list[list]:
     return rows
 
 
+
+# =========================
+# PERSONALIZED USER EXPERIENCE REPORT
+# =========================
+
+
+def get_personalized_ux_dimensions():
+    return [
+        {
+            "area": "Country Experience",
+            "dimension": "country",
+            "label": "Country",
+        },
+        {
+            "area": "Language Experience",
+            "dimension": "language",
+            "label": "Language",
+        },
+        {
+            "area": "Device Experience",
+            "dimension": "deviceCategory",
+            "label": "Device Category",
+        },
+        {
+            "area": "Operating System Experience",
+            "dimension": "operatingSystem",
+            "label": "Operating System",
+        },
+        {
+            "area": "App Version Experience",
+            "dimension": "appVersion",
+            "label": "App Version",
+        },
+        {
+            "area": "Acquisition Experience",
+            "dimension": "firstUserMedium",
+            "label": "First User Medium",
+        },
+        {
+            "area": "Screen Experience",
+            "dimension": "unifiedPagePathScreen",
+            "label": "Page Path / Screen Class",
+        },
+    ]
+
+
+def run_personalized_ux_report(
+    app: AppConfig,
+    dimension_name: str,
+    limit: int,
+):
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        dimensions=[
+            Dimension(name=dimension_name),
+        ],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="newUsers"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="userEngagementDuration"),
+            Metric(name="engagementRate"),
+        ],
+        limit=limit,
+    )
+
+    return beta_client.run_report(request)
+
+
+def safe_int(value) -> int:
+    try:
+        if value in [None, ""]:
+            return 0
+
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def safe_rate_text(numerator, denominator) -> str:
+    numerator_value = safe_int(numerator)
+    denominator_value = safe_int(denominator)
+
+    if denominator_value == 0:
+        return "0%"
+
+    return f"{round((numerator_value / denominator_value) * 100, 2)}%"
+
+
+def get_personalized_ux_recommendation(
+    area: str,
+    dimension_value: str,
+    active_users: int,
+    engagement_rate_raw,
+    avg_session_seconds,
+    user_share_text: str,
+) -> str:
+    if active_users == 0:
+        return "No personalization action needed because this segment has no users."
+
+    engagement_rate_value = to_float(engagement_rate_raw)
+    avg_seconds_value = to_float(avg_session_seconds)
+
+    if engagement_rate_value <= 1:
+        engagement_rate_percent = engagement_rate_value * 100
+    else:
+        engagement_rate_percent = engagement_rate_value
+
+    if active_users >= 100 and engagement_rate_percent < 40:
+        return (
+            f"High priority: users in {dimension_value} have low engagement. "
+            "Review onboarding, content relevance, loading speed, and screen flow for this segment."
+        )
+
+    if area == "Country Experience":
+        return (
+            f"Personalize store listing, language tone, pricing, and onboarding for {dimension_value}. "
+            f"This segment represents {user_share_text} of active users."
+        )
+
+    if area == "Language Experience":
+        return (
+            f"Consider localized UI text, onboarding, and support content for {dimension_value} users."
+        )
+
+    if area == "Device Experience":
+        return (
+            f"Optimize layout, performance, and touch targets for {dimension_value} users."
+        )
+
+    if area == "Operating System Experience":
+        return (
+            f"QA crashes, permissions, speed, and UI compatibility for {dimension_value} users."
+        )
+
+    if area == "App Version Experience":
+        return (
+            f"Compare this app version with other versions. If engagement is lower, check release changes and bugs for {dimension_value}."
+        )
+
+    if area == "Acquisition Experience":
+        return (
+            f"Customize onboarding and first-session messaging for users coming from {dimension_value}."
+        )
+
+    if area == "Screen Experience":
+        if avg_seconds_value > 600:
+            return (
+                f"Users spend a long time on {dimension_value}. Check whether this is positive engagement or a confusing flow."
+            )
+
+        return (
+            f"Prioritize UX review for this high-traffic screen: {dimension_value}."
+        )
+
+    return "Review this segment for personalization opportunities."
+
+
+def parse_personalized_ux_response(
+    app: AppConfig,
+    response,
+    area: str,
+    dimension_name: str,
+    dimension_label: str,
+    total_active_users: int,
+):
+    rows = []
+    report_date_range = get_report_date_range_display()
+
+    if not response.rows:
+        return [
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                area,
+                dimension_label,
+                dimension_name,
+                "",
+                0,
+                "0%",
+                0,
+                0,
+                0,
+                0,
+                0,
+                "0m 0s",
+                0,
+                "0m 0s",
+                0,
+                "0%",
+                "No users found for this personalization dimension.",
+                "NO UX DATA",
+                "",
+                now_text(),
+            ]
+        ]
+
+    dimension_headers = [header.name for header in response.dimension_headers]
+    metric_headers = [header.name for header in response.metric_headers]
+
+    parsed_rows = []
+
+    for row in response.rows:
+        row_data = {}
+
+        for index, dimension_value in enumerate(row.dimension_values):
+            row_data[dimension_headers[index]] = dimension_value.value
+
+        for index, metric_value in enumerate(row.metric_values):
+            row_data[metric_headers[index]] = metric_value.value
+
+        dimension_value = row_data.get(dimension_name, "")
+
+        if not str(dimension_value).strip():
+            dimension_value = "(not set)"
+
+        active_users = safe_int(row_data.get("activeUsers", 0))
+        parsed_rows.append((active_users, dimension_value, row_data))
+
+    parsed_rows.sort(key=lambda item: item[0], reverse=True)
+
+    for rank, (active_users, dimension_value, row_data) in enumerate(parsed_rows, start=1):
+        new_users = safe_int(row_data.get("newUsers", 0))
+        sessions = safe_int(row_data.get("sessions", 0))
+        engaged_sessions = safe_int(row_data.get("engagedSessions", 0))
+
+        avg_session_seconds = to_float(row_data.get("averageSessionDuration", 0))
+        total_engagement_seconds = to_float(row_data.get("userEngagementDuration", 0))
+
+        if active_users > 0:
+            sessions_per_active_user = round(sessions / active_users, 2)
+        else:
+            sessions_per_active_user = 0
+
+        user_share = safe_rate_text(active_users, total_active_users)
+        engagement_rate_raw = row_data.get("engagementRate", 0)
+
+        recommendation = get_personalized_ux_recommendation(
+            area=area,
+            dimension_value=dimension_value,
+            active_users=active_users,
+            engagement_rate_raw=engagement_rate_raw,
+            avg_session_seconds=avg_session_seconds,
+            user_share_text=user_share,
+        )
+
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                area,
+                dimension_label,
+                dimension_name,
+                dimension_value,
+                rank,
+                user_share,
+                active_users,
+                new_users,
+                sessions,
+                engaged_sessions,
+                round(avg_session_seconds, 2),
+                format_seconds(avg_session_seconds),
+                round(total_engagement_seconds, 2),
+                format_seconds(total_engagement_seconds),
+                sessions_per_active_user,
+                to_percent(engagement_rate_raw),
+                recommendation,
+                "SUCCESS",
+                "",
+                now_text(),
+            ]
+        )
+
+    return rows
+
+
+def build_personalized_ux_rows_for_app(
+    app: AppConfig,
+    total_active_users,
+) -> list[list]:
+    rows = []
+    total_active_users_value = safe_int(total_active_users)
+    report_limit = max(config.ux_report_limit, 1)
+
+    for dimension_config in get_personalized_ux_dimensions():
+        area = dimension_config["area"]
+        dimension_name = dimension_config["dimension"]
+        dimension_label = dimension_config["label"]
+
+        try:
+            response = run_personalized_ux_report(
+                app=app,
+                dimension_name=dimension_name,
+                limit=report_limit,
+            )
+
+            rows.extend(
+                parse_personalized_ux_response(
+                    app=app,
+                    response=response,
+                    area=area,
+                    dimension_name=dimension_name,
+                    dimension_label=dimension_label,
+                    total_active_users=total_active_users_value,
+                )
+            )
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    get_report_date_range_display(),
+                    area,
+                    dimension_label,
+                    dimension_name,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+    return rows
+
 # =========================
 # MAIN
 # =========================
@@ -1135,6 +1485,34 @@ def main():
             "Total Engagement Time",
             "Sessions Per Active User",
             "Engagement Rate",
+            "Status",
+            "Error",
+            "Updated At",
+        ]
+    ]
+
+    personalized_ux_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Report Date Range",
+            "Personalization Area",
+            "Dimension Label",
+            "Dimension Field",
+            "Dimension Value",
+            "Rank",
+            "Active User Share",
+            "Active Users",
+            "New Users",
+            "Sessions",
+            "Engaged Sessions",
+            "Avg Session Duration Seconds",
+            "Avg Session Duration",
+            "Total Engagement Seconds",
+            "Total Engagement Time",
+            "Sessions Per Active User",
+            "Engagement Rate",
+            "Recommendation",
             "Status",
             "Error",
             "Updated At",
@@ -1312,11 +1690,51 @@ def main():
                 ]
             )
 
+        # Personalized user experience
+        try:
+            app_personalized_ux_rows = build_personalized_ux_rows_for_app(
+                app=app,
+                total_active_users=session_data["active_users"],
+            )
+            personalized_ux_rows.extend(app_personalized_ux_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            personalized_ux_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
     write_sheet(config.summary_sheet, funnel_summary_rows)
     write_sheet(config.details_sheet, funnel_details_rows)
     write_sheet(config.user_session_sheet, user_session_rows)
     write_sheet(config.retention_details_sheet, retention_details_rows)
     write_sheet(config.audience_segments_sheet, audience_segment_rows)
+    write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -1324,6 +1742,7 @@ def main():
     print(f"User Session Summary: {config.user_session_sheet}")
     print(f"Retention Details: {config.retention_details_sheet}")
     print(f"Audience Segments: {config.audience_segments_sheet}")
+    print(f"Personalized UX: {config.personalized_ux_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
