@@ -46,6 +46,7 @@ class Config:
     user_session_sheet: str
     retention_details_sheet: str
     audience_segments_sheet: str
+    personalized_ux_sheet: str
 
     start_date: str
     end_date: str
@@ -55,6 +56,7 @@ class Config:
     default_screen_field: str
 
     retention_days: int
+    ux_report_limit: int
 
 
 def load_config() -> Config:
@@ -77,6 +79,10 @@ def load_config() -> Config:
             "AUDIENCE_SEGMENTS_SHEET",
             "GA4 Audience Segments",
         ),
+        personalized_ux_sheet=optional_env(
+            "PERSONALIZED_UX_SHEET",
+            "GA4 Personalized User Experience",
+        ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
         end_date=optional_env("END_DATE", "yesterday"),
@@ -92,4 +98,5 @@ def load_config() -> Config:
         ),
 
         retention_days=optional_int_env("RETENTION_DAYS", 7),
+        ux_report_limit=optional_int_env("UX_REPORT_LIMIT", 10),
     )
