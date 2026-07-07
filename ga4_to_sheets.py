@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
+
 from google.analytics.data_v1alpha import AlphaAnalyticsDataClient
 from google.analytics.data_v1alpha.types import (
-    DateRange,
+    DateRange as AlphaDateRange,
     Funnel,
     FunnelStep,
     FunnelEventFilter,
@@ -17,6 +18,18 @@ from google.analytics.data_v1alpha.types import (
     RunFunnelReportRequest,
     StringFilter,
 )
+
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.analytics.data_v1beta.types import (
+    DateRange as BetaDateRange,
+    Dimension,
+    Metric,
+    RunReportRequest,
+    Cohort,
+    CohortSpec,
+    CohortsRange,
+)
+
 from googleapiclient.discovery import build
 
 from config import SCOPES, load_config
@@ -43,6 +56,9 @@ def get_credentials():
 
 
 credentials = get_credentials()
+
+alpha_client = AlphaAnalyticsDataClient(credentials=credentials)
+beta_client = BetaAnalyticsDataClient(credentials=credentials)
 
 
 def get_sheets_service():
@@ -81,19 +97,35 @@ def ensure_sheet_exists(service, sheet_name: str):
         ).execute()
 
 
+def write_sheet(sheet_name: str, rows: list[list]):
+    service = get_sheets_service()
+    ensure_sheet_exists(service, sheet_name)
+
+    service.spreadsheets().values().clear(
+        spreadsheetId=config.spreadsheet_id,
+        range=f"{sheet_name}!A:Z",
+        body={},
+    ).execute()
+
+    service.spreadsheets().values().update(
+        spreadsheetId=config.spreadsheet_id,
+        range=f"{sheet_name}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
+
+
 def create_apps_config_template(service):
     ensure_sheet_exists(service, config.apps_config_sheet)
 
-    headers = [
-        "Enabled",
-        "App Name",
-        "Property ID",
-        "Home Screen Name",
-        "Screen Field",
-    ]
-
-    sample_rows = [
-        headers,
+    rows = [
+        [
+            "Enabled",
+            "App Name",
+            "Property ID",
+            "Home Screen Name",
+            "Screen Field",
+        ],
         [
             "TRUE",
             "ai-voice-generator-b2073",
@@ -114,7 +146,7 @@ def create_apps_config_template(service):
         spreadsheetId=config.spreadsheet_id,
         range=f"{config.apps_config_sheet}!A1",
         valueInputOption="USER_ENTERED",
-        body={"values": sample_rows},
+        body={"values": rows},
     ).execute()
 
 
@@ -132,7 +164,7 @@ def read_apps_config() -> list[AppConfig]:
     if len(values) <= 1:
         create_apps_config_template(service)
         raise SystemExit(
-            "Apps Config sheet was empty. Template created. Fill your 20+ apps and run again."
+            "Apps Config sheet was empty. Template created. Fill apps and run again."
         )
 
     apps = []
@@ -141,14 +173,24 @@ def read_apps_config() -> list[AppConfig]:
         enabled = row[0].strip().upper() if len(row) > 0 else ""
         app_name = row[1].strip() if len(row) > 1 else ""
         property_id = row[2].strip() if len(row) > 2 else ""
-        home_screen_name = row[3].strip() if len(row) > 3 and row[3].strip() else config.default_home_screen_name
-        screen_field = row[4].strip() if len(row) > 4 and row[4].strip() else config.default_screen_field
+
+        home_screen_name = (
+            row[3].strip()
+            if len(row) > 3 and row[3].strip()
+            else config.default_home_screen_name
+        )
+
+        screen_field = (
+            row[4].strip()
+            if len(row) > 4 and row[4].strip()
+            else config.default_screen_field
+        )
 
         if enabled not in ["TRUE", "YES", "1", "Y"]:
             continue
 
         if not app_name or not property_id:
-            print(f"Skipping row {index}: App Name or Property ID missing.")
+            print(f"Skipping row {index}: app name or property ID missing.")
             continue
 
         apps.append(
@@ -164,6 +206,12 @@ def read_apps_config() -> list[AppConfig]:
         raise SystemExit("No enabled apps found in Apps Config sheet.")
 
     return apps
+
+
+def now_text() -> str:
+    return datetime.now(
+        ZoneInfo(config.timezone)
+    ).strftime("%Y-%m-%d %I:%M:%S %p")
 
 
 def resolve_ga4_date(value: str) -> str:
@@ -188,70 +236,28 @@ def resolve_ga4_date(value: str) -> str:
     return value
 
 
-def get_date_range_display() -> str:
+def get_report_date_range_display() -> str:
     start = resolve_ga4_date(config.start_date)
     end = resolve_ga4_date(config.end_date)
+
     return f"{start} to {end}"
 
 
-def funnel_event_filter(event_name: str) -> FunnelFilterExpression:
-    return FunnelFilterExpression(
-        funnel_event_filter=FunnelEventFilter(
-            event_name=event_name
-        )
-    )
+def get_retention_cohort_date_range() -> tuple[str, str]:
+    report_start = datetime.fromisoformat(
+        resolve_ga4_date(config.start_date)
+    ).date()
 
+    report_end = datetime.fromisoformat(
+        resolve_ga4_date(config.end_date)
+    ).date()
 
-def funnel_contains_filter(field_name: str, value: str) -> FunnelFilterExpression:
-    return FunnelFilterExpression(
-        funnel_field_filter=FunnelFieldFilter(
-            field_name=field_name,
-            string_filter=StringFilter(
-                match_type=StringFilter.MatchType.CONTAINS,
-                value=value,
-                case_sensitive=False,
-            ),
-        )
-    )
+    cohort_end = report_end - timedelta(days=config.retention_days)
 
+    if cohort_end < report_start:
+        cohort_end = report_start
 
-def run_first_open_to_home_funnel(app: AppConfig):
-    client = AlphaAnalyticsDataClient(credentials=credentials)
-
-    request = RunFunnelReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[
-            DateRange(
-                start_date=config.start_date,
-                end_date=config.end_date,
-            )
-        ],
-        funnel=Funnel(
-            is_open_funnel=False,
-            steps=[
-                FunnelStep(
-                    name="First Open",
-                    filter_expression=funnel_event_filter("first_open"),
-                ),
-                FunnelStep(
-                    name="Home Users",
-                    filter_expression=FunnelFilterExpression(
-                        and_group=FunnelFilterExpressionList(
-                            expressions=[
-                                funnel_event_filter("screen_view"),
-                                funnel_contains_filter(
-                                    app.screen_field,
-                                    app.home_screen_name,
-                                ),
-                            ]
-                        )
-                    ),
-                ),
-            ],
-        ),
-    )
-
-    return client.run_funnel_report(request)
+    return report_start.isoformat(), cohort_end.isoformat()
 
 
 def to_number(value):
@@ -289,6 +295,26 @@ def to_percent(value):
         return value
 
 
+def make_rate(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0%"
+
+    return f"{round((numerator / denominator) * 100, 2)}%"
+
+
+def format_seconds(seconds_value) -> str:
+    seconds = int(round(to_float(seconds_value)))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+
+    return f"{minutes}m {seconds}s"
+
+
 def get_metric(row_data: dict, possible_names: list[str], default=""):
     for name in possible_names:
         if name in row_data:
@@ -297,19 +323,78 @@ def get_metric(row_data: dict, possible_names: list[str], default=""):
     return default
 
 
+# =========================
+# FUNNEL REPORT
+# =========================
+
+def funnel_event_filter(event_name: str) -> FunnelFilterExpression:
+    return FunnelFilterExpression(
+        funnel_event_filter=FunnelEventFilter(
+            event_name=event_name
+        )
+    )
+
+
+def funnel_contains_filter(field_name: str, value: str) -> FunnelFilterExpression:
+    return FunnelFilterExpression(
+        funnel_field_filter=FunnelFieldFilter(
+            field_name=field_name,
+            string_filter=StringFilter(
+                match_type=StringFilter.MatchType.CONTAINS,
+                value=value,
+                case_sensitive=False,
+            ),
+        )
+    )
+
+
+def run_first_open_to_home_funnel(app: AppConfig):
+    request = RunFunnelReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            AlphaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        funnel=Funnel(
+            is_open_funnel=False,
+            steps=[
+                FunnelStep(
+                    name="First Open",
+                    filter_expression=funnel_event_filter("first_open"),
+                ),
+                FunnelStep(
+                    name="Home Users",
+                    filter_expression=FunnelFilterExpression(
+                        and_group=FunnelFilterExpressionList(
+                            expressions=[
+                                funnel_event_filter("screen_view"),
+                                funnel_contains_filter(
+                                    app.screen_field,
+                                    app.home_screen_name,
+                                ),
+                            ]
+                        )
+                    ),
+                ),
+            ],
+        ),
+    )
+
+    return alpha_client.run_funnel_report(request)
+
+
 def parse_funnel_rows(app: AppConfig, response):
     table = response.funnel_table
 
     dimension_headers = [header.name for header in table.dimension_headers]
     metric_headers = [header.name for header in table.metric_headers]
 
-    updated_at = datetime.now(
-        ZoneInfo(config.timezone)
-    ).strftime("%Y-%m-%d %I:%M:%S %p")
+    updated_at = now_text()
+    date_range_display = get_report_date_range_display()
 
-    date_range_display = get_date_range_display()
-
-    details_rows = []
+    detail_rows = []
 
     first_open_users = 0
     home_users = 0
@@ -319,12 +404,10 @@ def parse_funnel_rows(app: AppConfig, response):
         row_data = {}
 
         for index, dimension_value in enumerate(row.dimension_values):
-            header_name = dimension_headers[index]
-            row_data[header_name] = dimension_value.value
+            row_data[dimension_headers[index]] = dimension_value.value
 
         for index, metric_value in enumerate(row.metric_values):
-            header_name = metric_headers[index]
-            row_data[header_name] = metric_value.value
+            row_data[metric_headers[index]] = metric_value.value
 
         funnel_step = row_data.get("funnelStepName", "")
 
@@ -379,7 +462,7 @@ def parse_funnel_rows(app: AppConfig, response):
             event_name = ""
             screen_condition = ""
 
-        details_rows.append(
+        detail_rows.append(
             [
                 app.app_name,
                 app.property_id,
@@ -398,9 +481,9 @@ def parse_funnel_rows(app: AppConfig, response):
         )
 
     if first_open_users > 0:
-        conversion_rate = f"{round((home_users / first_open_users) * 100, 2)}%"
+        conversion_rate = make_rate(home_users, first_open_users)
         drop_off = first_open_users - home_users
-        abandonment_rate = f"{round((drop_off / first_open_users) * 100, 2)}%"
+        abandonment_rate = make_rate(drop_off, first_open_users)
     else:
         conversion_rate = "0%"
         drop_off = 0
@@ -425,26 +508,271 @@ def parse_funnel_rows(app: AppConfig, response):
         updated_at,
     ]
 
-    return summary_row, details_rows
+    return summary_row, detail_rows
 
 
-def write_sheet(sheet_name: str, rows: list[list]):
-    service = get_sheets_service()
-    ensure_sheet_exists(service, sheet_name)
+# =========================
+# USER + SESSION REPORT
+# =========================
 
-    service.spreadsheets().values().clear(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{sheet_name}!A:Z",
-        body={},
-    ).execute()
+def run_user_session_report(app: AppConfig):
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="newUsers"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="userEngagementDuration"),
+            Metric(name="engagementRate"),
+        ],
+    )
 
-    service.spreadsheets().values().update(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{sheet_name}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": rows},
-    ).execute()
+    return beta_client.run_report(request)
 
+
+def parse_user_session_report(response) -> dict:
+    if not response.rows:
+        return {
+            "active_users": 0,
+            "new_users": 0,
+            "sessions": 0,
+            "engaged_sessions": 0,
+            "average_session_duration_seconds": 0,
+            "average_session_duration": "0m 0s",
+            "total_engagement_seconds": 0,
+            "total_engagement_time": "0m 0s",
+            "sessions_per_active_user": 0,
+            "engagement_rate": "0%",
+        }
+
+    metric_headers = [header.name for header in response.metric_headers]
+    row = response.rows[0]
+
+    row_data = {}
+
+    for index, metric_value in enumerate(row.metric_values):
+        row_data[metric_headers[index]] = metric_value.value
+
+    active_users = to_number(row_data.get("activeUsers", 0))
+    new_users = to_number(row_data.get("newUsers", 0))
+    sessions = to_number(row_data.get("sessions", 0))
+    engaged_sessions = to_number(row_data.get("engagedSessions", 0))
+
+    avg_session_seconds = to_float(row_data.get("averageSessionDuration", 0))
+    total_engagement_seconds = to_float(row_data.get("userEngagementDuration", 0))
+
+    if active_users > 0:
+        sessions_per_active_user = round(sessions / active_users, 2)
+    else:
+        sessions_per_active_user = 0
+
+    return {
+        "active_users": active_users,
+        "new_users": new_users,
+        "sessions": sessions,
+        "engaged_sessions": engaged_sessions,
+        "average_session_duration_seconds": round(avg_session_seconds, 2),
+        "average_session_duration": format_seconds(avg_session_seconds),
+        "total_engagement_seconds": round(total_engagement_seconds, 2),
+        "total_engagement_time": format_seconds(total_engagement_seconds),
+        "sessions_per_active_user": sessions_per_active_user,
+        "engagement_rate": to_percent(row_data.get("engagementRate", 0)),
+    }
+
+
+# =========================
+# RETENTION REPORT
+# =========================
+
+def run_retention_report(app: AppConfig):
+    cohort_start, cohort_end = get_retention_cohort_date_range()
+
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        dimensions=[
+            Dimension(name="cohort"),
+            Dimension(name="cohortNthDay"),
+        ],
+        metrics=[
+            Metric(name="cohortActiveUsers"),
+            Metric(name="cohortTotalUsers"),
+        ],
+        cohort_spec=CohortSpec(
+            cohorts=[
+                Cohort(
+                    name="Acquired Users",
+                    date_range=BetaDateRange(
+                        start_date=cohort_start,
+                        end_date=cohort_end,
+                    ),
+                )
+            ],
+            cohorts_range=CohortsRange(
+                granularity=CohortsRange.Granularity.DAILY,
+                start_offset=0,
+                end_offset=config.retention_days,
+            ),
+        ),
+        keep_empty_rows=True,
+    )
+
+    return beta_client.run_report(request)
+
+
+def parse_cohort_day(value: str) -> int:
+    value = str(value).strip()
+
+    if value == "":
+        return 0
+
+    try:
+        return int(value)
+    except ValueError:
+        digits = re.sub(r"\D", "", value)
+
+        if digits == "":
+            return 0
+
+        return int(digits)
+
+
+def parse_retention_report(app: AppConfig, response):
+    dimension_headers = [header.name for header in response.dimension_headers]
+    metric_headers = [header.name for header in response.metric_headers]
+
+    cohort_start, cohort_end = get_retention_cohort_date_range()
+    cohort_date_range = f"{cohort_start} to {cohort_end}"
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+
+    rows_by_day = {}
+
+    for row in response.rows:
+        row_data = {}
+
+        for index, dimension_value in enumerate(row.dimension_values):
+            row_data[dimension_headers[index]] = dimension_value.value
+
+        for index, metric_value in enumerate(row.metric_values):
+            row_data[metric_headers[index]] = metric_value.value
+
+        cohort_name = row_data.get("cohort", "Acquired Users")
+        day_number = parse_cohort_day(row_data.get("cohortNthDay", "0"))
+
+        active_users = to_number(row_data.get("cohortActiveUsers", 0))
+        total_users = to_number(row_data.get("cohortTotalUsers", 0))
+
+        rows_by_day[day_number] = {
+            "cohort_name": cohort_name,
+            "active_users": active_users,
+            "total_users": total_users,
+            "retention_rate": make_rate(active_users, total_users),
+        }
+
+    detail_rows = []
+
+    for day in range(0, config.retention_days + 1):
+        data = rows_by_day.get(
+            day,
+            {
+                "cohort_name": "Acquired Users",
+                "active_users": 0,
+                "total_users": 0,
+                "retention_rate": "0%",
+            },
+        )
+
+        detail_rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                cohort_date_range,
+                data["cohort_name"],
+                f"D{day}",
+                day,
+                data["active_users"],
+                data["total_users"],
+                data["retention_rate"],
+                "SUCCESS",
+                "",
+                updated_at,
+            ]
+        )
+
+    cohort_total_users = 0
+
+    for data in rows_by_day.values():
+        if data["total_users"] > cohort_total_users:
+            cohort_total_users = data["total_users"]
+
+    d1_data = rows_by_day.get(
+        1,
+        {
+            "active_users": 0,
+            "retention_rate": "0%",
+        },
+    )
+
+    d7_data = rows_by_day.get(
+        7,
+        {
+            "active_users": 0,
+            "retention_rate": "0%",
+        },
+    )
+
+    summary = {
+        "cohort_date_range": cohort_date_range,
+        "cohort_total_users": cohort_total_users,
+        "d1_active_users": d1_data["active_users"],
+        "d1_retention": d1_data["retention_rate"],
+        "d7_active_users": d7_data["active_users"],
+        "d7_retention": d7_data["retention_rate"],
+    }
+
+    return summary, detail_rows
+
+
+def empty_session_data() -> dict:
+    return {
+        "active_users": "",
+        "new_users": "",
+        "sessions": "",
+        "engaged_sessions": "",
+        "average_session_duration_seconds": "",
+        "average_session_duration": "",
+        "total_engagement_seconds": "",
+        "total_engagement_time": "",
+        "sessions_per_active_user": "",
+        "engagement_rate": "",
+    }
+
+
+def empty_retention_summary() -> dict:
+    cohort_start, cohort_end = get_retention_cohort_date_range()
+
+    return {
+        "cohort_date_range": f"{cohort_start} to {cohort_end}",
+        "cohort_total_users": "",
+        "d1_active_users": "",
+        "d1_retention": "",
+        "d7_active_users": "",
+        "d7_retention": "",
+    }
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
     print("Reading app list from Apps Config sheet...")
@@ -453,11 +781,7 @@ def main():
 
     print(f"Total enabled apps found: {len(apps)}")
 
-    updated_at = datetime.now(
-        ZoneInfo(config.timezone)
-    ).strftime("%Y-%m-%d %I:%M:%S %p")
-
-    summary_rows = [
+    funnel_summary_rows = [
         [
             "App Name",
             "Property ID",
@@ -475,7 +799,7 @@ def main():
         ]
     ]
 
-    details_rows = [
+    funnel_details_rows = [
         [
             "App Name",
             "Property ID",
@@ -493,28 +817,78 @@ def main():
         ]
     ]
 
-    date_range_display = get_date_range_display()
+    user_session_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Report Date Range",
+            "Active Users",
+            "New Users",
+            "Sessions",
+            "Engaged Sessions",
+            "Avg Session Duration Seconds",
+            "Avg Session Duration",
+            "Total Engagement Seconds",
+            "Total Engagement Time",
+            "Sessions Per Active User",
+            "Engagement Rate",
+            "Retention Cohort Date Range",
+            "Cohort Total Users",
+            "D1 Active Users",
+            "D1 Retention",
+            "D7 Active Users",
+            "D7 Retention",
+            "Status",
+            "Error",
+            "Updated At",
+        ]
+    ]
+
+    retention_details_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Report Date Range",
+            "Retention Cohort Date Range",
+            "Cohort Name",
+            "Retention Day",
+            "Day Number",
+            "Cohort Active Users",
+            "Cohort Total Users",
+            "Retention Rate",
+            "Status",
+            "Error",
+            "Updated At",
+        ]
+    ]
+
+    report_date_range = get_report_date_range_display()
 
     for app in apps:
         print(f"Processing: {app.app_name} / {app.property_id}")
 
+        # Funnel
         try:
-            response = run_first_open_to_home_funnel(app)
-            summary_row, app_details_rows = parse_funnel_rows(app, response)
+            funnel_response = run_first_open_to_home_funnel(app)
+            funnel_summary_row, app_funnel_details = parse_funnel_rows(
+                app,
+                funnel_response,
+            )
 
-            summary_rows.append(summary_row)
-            details_rows.extend(app_details_rows)
+            funnel_summary_rows.append(funnel_summary_row)
+            funnel_details_rows.extend(app_funnel_details)
 
         except Exception as error:
             error_text = str(error)
+            updated_at = now_text()
 
-            print(f"ERROR for {app.app_name}: {error_text}")
+            print(f"FUNNEL ERROR for {app.app_name}: {error_text}")
 
-            summary_rows.append(
+            funnel_summary_rows.append(
                 [
                     app.app_name,
                     app.property_id,
-                    date_range_display,
+                    report_date_range,
                     "",
                     "",
                     "",
@@ -528,11 +902,11 @@ def main():
                 ]
             )
 
-            details_rows.append(
+            funnel_details_rows.append(
                 [
                     app.app_name,
                     app.property_id,
-                    date_range_display,
+                    report_date_range,
                     "",
                     "",
                     "",
@@ -546,13 +920,95 @@ def main():
                 ]
             )
 
-    write_sheet(config.summary_sheet, summary_rows)
-    write_sheet(config.details_sheet, details_rows)
+        # User/session + retention
+        session_data = empty_session_data()
+        retention_summary = empty_retention_summary()
 
-    print("Done. All apps updated in Google Sheet.")
-    print(f"Summary Sheet: {config.summary_sheet}")
-    print(f"Details Sheet: {config.details_sheet}")
-    print(f"Date Range: {date_range_display}")
+        errors = []
+
+        try:
+            session_response = run_user_session_report(app)
+            session_data = parse_user_session_report(session_response)
+
+        except Exception as error:
+            error_text = str(error)
+            errors.append(f"Session error: {error_text}")
+            print(f"SESSION ERROR for {app.app_name}: {error_text}")
+
+        try:
+            retention_response = run_retention_report(app)
+            retention_summary, app_retention_details = parse_retention_report(
+                app,
+                retention_response,
+            )
+
+            retention_details_rows.extend(app_retention_details)
+
+        except Exception as error:
+            error_text = str(error)
+            errors.append(f"Retention error: {error_text}")
+            print(f"RETENTION ERROR for {app.app_name}: {error_text}")
+
+            retention_details_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    retention_summary["cohort_date_range"],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "ERROR",
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+        status = "SUCCESS" if not errors else "ERROR"
+        error_text = " | ".join(errors)
+        updated_at = now_text()
+
+        user_session_rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                session_data["active_users"],
+                session_data["new_users"],
+                session_data["sessions"],
+                session_data["engaged_sessions"],
+                session_data["average_session_duration_seconds"],
+                session_data["average_session_duration"],
+                session_data["total_engagement_seconds"],
+                session_data["total_engagement_time"],
+                session_data["sessions_per_active_user"],
+                session_data["engagement_rate"],
+                retention_summary["cohort_date_range"],
+                retention_summary["cohort_total_users"],
+                retention_summary["d1_active_users"],
+                retention_summary["d1_retention"],
+                retention_summary["d7_active_users"],
+                retention_summary["d7_retention"],
+                status,
+                error_text,
+                updated_at,
+            ]
+        )
+
+    write_sheet(config.summary_sheet, funnel_summary_rows)
+    write_sheet(config.details_sheet, funnel_details_rows)
+    write_sheet(config.user_session_sheet, user_session_rows)
+    write_sheet(config.retention_details_sheet, retention_details_rows)
+
+    print("Done. All reports updated in Google Sheet.")
+    print(f"Funnel Summary: {config.summary_sheet}")
+    print(f"Funnel Details: {config.details_sheet}")
+    print(f"User Session Summary: {config.user_session_sheet}")
+    print(f"Retention Details: {config.retention_details_sheet}")
+    print(f"Report Date Range: {report_date_range}")
 
 
 if __name__ == "__main__":
