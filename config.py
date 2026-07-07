@@ -1,45 +1,95 @@
-name: GA4 to Google Sheets
+import os
+from dataclasses import dataclass
 
-on:
-  workflow_dispatch:
 
-  schedule:
-    - cron: "0 4 * * *"
+SCOPES = [
+    "https://www.googleapis.com/auth/analytics.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
-jobs:
-  ga4-to-sheets:
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+def required_env(name: str) -> str:
+    value = os.getenv(name)
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"Missing required environment variable: {name}")
 
-      - name: Install packages
-        run: pip install -r requirements.txt
+    return str(value).strip()
 
-      - name: Run GA4 script
-        env:
-          GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-          START_DATE: ${{ vars.START_DATE || '28daysAgo' }}
-          END_DATE: ${{ vars.END_DATE || 'yesterday' }}
-          RETENTION_DAYS: ${{ vars.RETENTION_DAYS || '7' }}
+def optional_env(name: str, default: str) -> str:
+    value = os.getenv(name)
 
-          APPS_CONFIG_SHEET: Apps Config
-          SUMMARY_SHEET: GA4 Funnel Summary
-          DETAILS_SHEET: GA4 Funnel Details
-          USER_SESSION_SHEET: GA4 User Session Summary
-          RETENTION_DETAILS_SHEET: GA4 Retention Details
-          AUDIENCE_SEGMENTS_SHEET: GA4 Audience Segments
+    if value is None or str(value).strip() == "":
+        return default
 
-          DEFAULT_HOME_SCREEN_NAME: MainActivity
-          DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
-          TIMEZONE: Asia/Karachi
+    return str(value).strip()
 
-        run: python ga4_to_sheets.py
+
+def optional_int_env(name: str, default: int) -> int:
+    value = optional_env(name, str(default))
+
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a number. Current value: {value}")
+
+
+@dataclass(frozen=True)
+class Config:
+    spreadsheet_id: str
+    service_account_json: str
+
+    apps_config_sheet: str
+    summary_sheet: str
+    details_sheet: str
+    user_session_sheet: str
+    retention_details_sheet: str
+    audience_segments_sheet: str
+
+    start_date: str
+    end_date: str
+    timezone: str
+
+    default_home_screen_name: str
+    default_screen_field: str
+
+    retention_days: int
+
+
+def load_config() -> Config:
+    return Config(
+        spreadsheet_id=required_env("SPREADSHEET_ID"),
+        service_account_json=required_env("GA4_SERVICE_ACCOUNT_JSON"),
+
+        apps_config_sheet=optional_env("APPS_CONFIG_SHEET", "Apps Config"),
+        summary_sheet=optional_env("SUMMARY_SHEET", "GA4 Funnel Summary"),
+        details_sheet=optional_env("DETAILS_SHEET", "GA4 Funnel Details"),
+        user_session_sheet=optional_env(
+            "USER_SESSION_SHEET",
+            "GA4 User Session Summary",
+        ),
+        retention_details_sheet=optional_env(
+            "RETENTION_DETAILS_SHEET",
+            "GA4 Retention Details",
+        ),
+        audience_segments_sheet=optional_env(
+            "AUDIENCE_SEGMENTS_SHEET",
+            "GA4 Audience Segments",
+        ),
+
+        start_date=optional_env("START_DATE", "28daysAgo"),
+        end_date=optional_env("END_DATE", "yesterday"),
+        timezone=optional_env("TIMEZONE", "Asia/Karachi"),
+
+        default_home_screen_name=optional_env(
+            "DEFAULT_HOME_SCREEN_NAME",
+            "MainActivity",
+        ),
+        default_screen_field=optional_env(
+            "DEFAULT_SCREEN_FIELD",
+            "unifiedPagePathScreen",
+        ),
+
+        retention_days=optional_int_env("RETENTION_DAYS", 7),
+    )
