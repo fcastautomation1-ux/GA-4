@@ -36,6 +36,8 @@ jobs:
           DETAILS_SHEET: GA4 Funnel Details
           USER_SESSION_SHEET: GA4 User Session Summary
           RETENTION_DETAILS_SHEET: GA4 Retention Details
+          NOTIFICATION_DAILY_SHEET: GA4 Daily Notifications
+          NOTIFICATION_EVENTS: notification_receive,notification_open,notification_foreground,notification_dismiss
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
           DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
