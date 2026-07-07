@@ -8,7 +8,7 @@ on:
 
 jobs:
   ga4-to-sheets:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latests
 
     steps:
       - name: Checkout repo
