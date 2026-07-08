@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
@@ -53,6 +54,7 @@ class AppConfig:
     firebase_project_name: str
     firebase_app_id: str
     time_capping_parameter: str
+    daily_notification_parameters: str
 
 
 def get_credentials():
@@ -113,7 +115,7 @@ def write_sheet(sheet_name: str, rows: list[list]):
 
     service.spreadsheets().values().clear(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{sheet_name}!A:Z",
+        range=f"{sheet_name}!A:ZZ",
         body={},
     ).execute()
 
@@ -137,6 +139,7 @@ def get_apps_config_headers() -> list[str]:
         "Firebase Project Name",
         "Firebase App ID",
         "Time Capping Parameter",
+        "Daily Notification Parameters",
     ]
 
 
@@ -149,7 +152,7 @@ def ensure_apps_config_headers(service, values: list[list]):
 
     service.spreadsheets().values().update(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A1:I1",
+        range=f"{config.apps_config_sheet}!A1:J1",
         valueInputOption="USER_ENTERED",
         body={"values": [expected_headers]},
     ).execute()
@@ -169,6 +172,7 @@ def create_apps_config_template(service):
             "Your Firebase Project Name",
             "1:1234567890:android:abcdef123456",
             "ad_time_capping",
+            "",
         ],
         [
             "TRUE",
@@ -180,6 +184,7 @@ def create_apps_config_template(service):
             "Antivirus vibrant soft",
             "1:1234567890:android:abcdef123456",
             "ad_time_capping",
+            "",
         ],
     ]
 
@@ -197,7 +202,7 @@ def read_apps_config() -> list[AppConfig]:
 
     response = service.spreadsheets().values().get(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A:I",
+        range=f"{config.apps_config_sheet}!A:J",
     ).execute()
 
     values = response.get("values", [])
@@ -237,6 +242,11 @@ def read_apps_config() -> list[AppConfig]:
             if len(row) > 8 and row[8].strip()
             else config.time_capping_parameter
         )
+        daily_notification_parameters = (
+            row[9].strip()
+            if len(row) > 9 and row[9].strip()
+            else config.daily_notification_parameters
+        )
 
         if enabled not in ["TRUE", "YES", "1", "Y"]:
             continue
@@ -255,6 +265,7 @@ def read_apps_config() -> list[AppConfig]:
                 firebase_project_name=firebase_project_name,
                 firebase_app_id=firebase_app_id,
                 time_capping_parameter=time_capping_parameter,
+                daily_notification_parameters=daily_notification_parameters,
             )
         )
 
@@ -383,6 +394,17 @@ def classify_api_error(error) -> tuple[str, str]:
     error_text = str(error)
     error_lower = error_text.lower()
 
+    api_not_enabled_keywords = [
+        "service_disabled",
+        "api has not been used",
+        "has not been enabled",
+        "it is disabled",
+        "api not enabled",
+        "enable it by visiting",
+        "service disabled",
+        "api disabled",
+    ]
+
     no_access_keywords = [
         "403",
         "permission denied",
@@ -397,14 +419,6 @@ def classify_api_error(error) -> tuple[str, str]:
         "not found",
         "property not found",
         "invalid property",
-    ]
-
-    api_not_enabled_keywords = [
-        "api has not been used",
-        "has not been enabled",
-        "enable it by visiting",
-        "service disabled",
-        "api disabled",
     ]
 
     if any(keyword in error_lower for keyword in api_not_enabled_keywords):
@@ -2081,6 +2095,892 @@ def build_time_capping_ab_rows_for_app(app: AppConfig) -> list[list]:
 
     return rows
 
+
+# =========================
+# DAILY NOTIFICATIONS
+# =========================
+
+notification_api_session = None
+
+
+def split_csv(value: str) -> list[str]:
+    if value is None:
+        return []
+
+    parts = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            parts.append(item)
+
+    return parts
+
+
+def get_notification_keywords() -> list[str]:
+    return [item.lower() for item in split_csv(config.notification_parameter_keywords)]
+
+
+def get_app_notification_parameter_keys(app: AppConfig) -> list[str]:
+    return split_csv(app.daily_notification_parameters or config.daily_notification_parameters)
+
+
+def iter_remote_config_parameters(template: dict):
+    parameters = template.get("parameters", {}) or {}
+
+    for parameter_key, parameter in parameters.items():
+        yield parameter_key, parameter, ""
+
+    parameter_groups = template.get("parameterGroups", {}) or {}
+
+    for group_name, group_data in parameter_groups.items():
+        group_parameters = group_data.get("parameters", {}) or {}
+        for parameter_key, parameter in group_parameters.items():
+            yield parameter_key, parameter, group_name
+
+
+def is_notification_parameter_key(parameter_key: str, explicit_keys: list[str]) -> bool:
+    key_lower = str(parameter_key).lower()
+
+    if explicit_keys:
+        explicit_lower = [item.lower() for item in explicit_keys]
+        return any(
+            key_lower == item or item in key_lower or key_lower in item
+            for item in explicit_lower
+        )
+
+    keywords = get_notification_keywords()
+    return any(keyword and keyword in key_lower for keyword in keywords)
+
+
+def get_parameter_value_rows(parameter: dict, condition_lookup: dict, condition_priority: dict) -> list[dict]:
+    value_rows = []
+
+    default_value_object = parameter.get("defaultValue")
+    if default_value_object:
+        value_rows.append(
+            {
+                "value_source": "Default value",
+                "condition_name": "Default",
+                "value_object": default_value_object,
+                "condition_priority": "",
+                "condition_expression": "",
+            }
+        )
+
+    conditional_values = parameter.get("conditionalValues", {}) or {}
+
+    for condition_name, value_object in conditional_values.items():
+        condition = condition_lookup.get(condition_name, {}) or {}
+        value_rows.append(
+            {
+                "value_source": "Conditional value",
+                "condition_name": condition_name,
+                "value_object": value_object,
+                "condition_priority": condition_priority.get(condition_name, ""),
+                "condition_expression": condition.get("expression", ""),
+            }
+        )
+
+    return value_rows
+
+
+def value_object_to_plain_values(value_object: dict | None) -> list[dict]:
+    if not value_object:
+        return []
+
+    if "value" in value_object:
+        return [
+            {
+                "value": str(value_object.get("value", "")),
+                "experiment_id": "",
+                "variant_id": "",
+                "variant_label": "",
+            }
+        ]
+
+    if "experimentValue" in value_object:
+        experiment = value_object.get("experimentValue", {}) or {}
+        experiment_id = experiment.get("experimentId", "")
+        values = []
+
+        for variant in experiment.get("variantValue", []) or []:
+            if "value" in variant:
+                variant_value = str(variant.get("value", ""))
+            elif variant.get("noChange") is True:
+                variant_value = "No change"
+            else:
+                variant_value = ""
+
+            values.append(
+                {
+                    "value": variant_value,
+                    "experiment_id": experiment_id,
+                    "variant_id": variant.get("variantId", ""),
+                    "variant_label": "Experiment variant",
+                }
+            )
+
+        return values
+
+    if value_object.get("useInAppDefault") is True:
+        return [
+            {
+                "value": "Use in-app default",
+                "experiment_id": "",
+                "variant_id": "",
+                "variant_label": "",
+            }
+        ]
+
+    return [
+        {
+            "value": format_remote_config_value(value_object),
+            "experiment_id": "",
+            "variant_id": "",
+            "variant_label": "",
+        }
+    ]
+
+
+def first_value(data: dict, keys: list[str]) -> str:
+    for key in keys:
+        if key in data and data[key] not in [None, ""]:
+            value = data[key]
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+    return ""
+
+
+def find_time_in_text(text_value: str) -> str:
+    value = str(text_value or "")
+
+    patterns = [
+        r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\s*(?:AM|PM|am|pm)?\b",
+        r"\b(?:1[0-2]|0?[1-9])\s*(?:AM|PM|am|pm)\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            return match.group(0).strip()
+
+    return ""
+
+
+def parameter_key_has_token(parameter_key: str, token: str) -> bool:
+    key = str(parameter_key).lower()
+    token = str(token).lower()
+
+    if token in ["title", "heading", "headline", "subject", "body", "content", "text", "message", "description", "desc", "time", "hour", "schedule"]:
+        return token in key
+
+    return re.search(rf"(^|[_\-.\s]){re.escape(token)}($|[_\-.\s])", key) is not None
+
+
+def get_field_type_from_parameter_key(parameter_key: str) -> str:
+    if any(parameter_key_has_token(parameter_key, token) for token in ["title", "heading", "headline", "subject"]):
+        return "title"
+
+    if any(parameter_key_has_token(parameter_key, token) for token in ["body", "content", "text", "message", "description", "desc"]):
+        return "body"
+
+    if any(parameter_key_has_token(parameter_key, token) for token in ["time", "hour", "schedule", "daily_at", "send_at"]):
+        return "time"
+
+    if any(parameter_key_has_token(parameter_key, token) for token in ["days", "weekday", "weekdays"]):
+        return "days"
+
+    return ""
+
+
+def get_group_key_from_parameter_key(parameter_key: str, field_type: str) -> str:
+    key = str(parameter_key).lower()
+    field_tokens = {
+        "title": ["title", "heading", "headline", "subject"],
+        "body": ["body", "content", "text", "message", "description", "desc"],
+        "time": ["time", "hour", "schedule", "daily_at", "send_at"],
+        "days": ["day", "days", "weekday"],
+    }.get(field_type, [])
+
+    for token in field_tokens:
+        key = re.sub(rf"(^|[_\-.\s]){re.escape(token)}($|[_\-.\s])", "_", key)
+        key = key.replace(token, "")
+
+    key = re.sub(r"[_\-.\s]+", "_", key).strip("_")
+    return key or str(parameter_key).lower()
+
+
+def extract_notification_fields(item, raw_value: str, parameter_key: str) -> dict:
+    title_keys = [
+        "title",
+        "notification_title",
+        "heading",
+        "headline",
+        "subject",
+        "name",
+    ]
+    body_keys = [
+        "body",
+        "notification_body",
+        "content",
+        "text",
+        "message",
+        "description",
+        "desc",
+    ]
+    time_keys = [
+        "time",
+        "send_time",
+        "schedule_time",
+        "notification_time",
+        "daily_time",
+        "hour",
+        "at",
+        "trigger_time",
+        "send_at",
+    ]
+    schedule_keys = ["schedule", "schedule_type", "frequency", "repeat", "type"]
+    days_keys = ["days", "day", "weekday", "weekdays", "repeat_days"]
+    timezone_keys = ["timezone", "time_zone", "tz"]
+
+    if isinstance(item, dict):
+        raw_item = json.dumps(item, ensure_ascii=False)
+        title = first_value(item, title_keys)
+        body = first_value(item, body_keys)
+        send_time = first_value(item, time_keys) or find_time_in_text(raw_item)
+        schedule_type = first_value(item, schedule_keys)
+        days = first_value(item, days_keys)
+        timezone = first_value(item, timezone_keys)
+        notification_id = first_value(item, ["id", "notification_id", "key", "name"])
+    else:
+        raw_item = str(item)
+        title = ""
+        body = ""
+        send_time = find_time_in_text(raw_item)
+        schedule_type = ""
+        days = ""
+        timezone = ""
+        notification_id = ""
+
+    field_type = get_field_type_from_parameter_key(parameter_key)
+
+    if field_type == "title" and not title:
+        title = str(raw_value)
+    elif field_type == "body" and not body:
+        body = str(raw_value)
+    elif field_type == "time" and not send_time:
+        send_time = str(raw_value)
+    elif field_type == "days" and not days:
+        days = str(raw_value)
+
+    if not send_time:
+        send_time = find_time_in_text(str(raw_value))
+
+    return {
+        "notification_id": notification_id,
+        "title": title,
+        "body": body,
+        "send_time": send_time,
+        "schedule_type": schedule_type,
+        "days": days,
+        "timezone": timezone,
+        "raw_value": raw_item if raw_item else str(raw_value),
+        "field_type": field_type,
+    }
+
+
+def extract_notification_items_from_value(raw_value: str, parameter_key: str) -> list[dict]:
+    value = str(raw_value or "").strip()
+
+    if value == "":
+        return []
+
+    parsed = None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        parsed = None
+
+    items = []
+
+    if isinstance(parsed, list):
+        for item in parsed:
+            items.append(extract_notification_fields(item, value, parameter_key))
+        return items
+
+    if isinstance(parsed, dict):
+        list_keys = [
+            "notifications",
+            "daily_notifications",
+            "dailyNotification",
+            "dailyNotifications",
+            "push_notifications",
+            "pushNotifications",
+            "messages",
+            "items",
+        ]
+
+        for list_key in list_keys:
+            nested = parsed.get(list_key)
+            if isinstance(nested, list):
+                for item in nested:
+                    items.append(extract_notification_fields(item, value, parameter_key))
+                return items
+
+        if any(key in parsed for key in ["title", "body", "content", "text", "message", "time", "send_time", "schedule_time"]):
+            return [extract_notification_fields(parsed, value, parameter_key)]
+
+        nested_items = []
+        for nested_key, nested_value in parsed.items():
+            if isinstance(nested_value, dict):
+                nested_value = dict(nested_value)
+                nested_value.setdefault("key", nested_key)
+                nested_items.append(extract_notification_fields(nested_value, value, parameter_key))
+            elif isinstance(nested_value, list):
+                for item in nested_value:
+                    nested_items.append(extract_notification_fields(item, value, parameter_key))
+
+        if nested_items:
+            return nested_items
+
+    return [extract_notification_fields(value, value, parameter_key)]
+
+
+def build_daily_notification_recommendation(title: str, body: str, send_time: str, raw_value: str) -> str:
+    missing = []
+
+    if not title:
+        missing.append("title")
+    if not body:
+        missing.append("body/content")
+    if not send_time:
+        missing.append("send time")
+
+    if missing:
+        return "Review raw Firebase value. Missing: " + ", ".join(missing) + "."
+
+    return "Daily notification text and time found from Firebase configuration. Verify this against the app UI and Firebase Messaging schedule."
+
+
+def make_daily_notification_empty_row(
+    base: list,
+    status: str,
+    message: str,
+    updated_at: str,
+    version_number: str = "",
+    update_time: str = "",
+    update_user: str = "",
+) -> list:
+    return base + [
+        "Remote Config",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        version_number,
+        update_time,
+        update_user,
+        status,
+        message,
+        updated_at,
+    ]
+
+
+def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+    explicit_keys = get_app_notification_parameter_keys(app)
+
+    base = [
+        app.app_name,
+        app.property_id,
+        app.firebase_project_id,
+        app.firebase_project_name,
+        app.firebase_app_id,
+        report_date_range,
+    ]
+
+    if not app.firebase_project_id:
+        return [
+            make_daily_notification_empty_row(
+                base,
+                "MISSING FIREBASE PROJECT ID",
+                "Add Firebase Project ID in Apps Config column F.",
+                updated_at,
+            )
+        ]
+
+    try:
+        template, etag = get_firebase_remote_config_template(app.firebase_project_id)
+        condition_lookup, condition_priority = get_condition_lookup(template)
+        version = template.get("version", {}) or {}
+        version_number = version.get("versionNumber", "")
+        update_time = version.get("updateTime", "")
+        update_user = (version.get("updateUser", {}) or {}).get("email", "")
+        matched_any = False
+        grouped = {}
+
+        for parameter_key, parameter, group_name in iter_remote_config_parameters(template):
+            if not is_notification_parameter_key(parameter_key, explicit_keys):
+                continue
+
+            matched_any = True
+            value_type = parameter.get("valueType", "STRING")
+
+            for value_row in get_parameter_value_rows(parameter, condition_lookup, condition_priority):
+                for plain_value in value_object_to_plain_values(value_row["value_object"]):
+                    raw_value = plain_value["value"]
+                    experiment_id = plain_value["experiment_id"]
+                    variant_id = plain_value["variant_id"]
+                    variant_suffix = f" / Variant {variant_id}" if variant_id else ""
+                    value_source = value_row["value_source"] + variant_suffix
+                    items = extract_notification_items_from_value(raw_value, parameter_key)
+
+                    if not items:
+                        continue
+
+                    for item_index, item in enumerate(items, start=1):
+                        field_type = item.get("field_type", "")
+                        if field_type == "time":
+                            simple_field_value = item.get("send_time", "")
+                        elif field_type in ["title", "body", "days"]:
+                            simple_field_value = item.get(field_type, "")
+                        else:
+                            simple_field_value = ""
+
+                        if field_type and simple_field_value and len(items) == 1:
+                            group_key = (
+                                value_row["condition_name"],
+                                experiment_id,
+                                variant_id,
+                                get_group_key_from_parameter_key(parameter_key, field_type),
+                            )
+                            grouped.setdefault(
+                                group_key,
+                                {
+                                    "parameter_keys": set(),
+                                    "group_name": group_name,
+                                    "value_source": value_source,
+                                    "condition_name": value_row["condition_name"],
+                                    "condition_priority": value_row["condition_priority"],
+                                    "condition_expression": value_row["condition_expression"],
+                                    "value_type": value_type,
+                                    "experiment_id": experiment_id,
+                                    "variant_id": variant_id,
+                                    "title": "",
+                                    "body": "",
+                                    "send_time": "",
+                                    "days": "",
+                                    "schedule_type": "Daily / Firebase configured",
+                                    "timezone": "",
+                                    "raw_values": [],
+                                },
+                            )
+                            grouped[group_key]["parameter_keys"].add(parameter_key)
+                            grouped[group_key]["raw_values"].append(f"{parameter_key}: {raw_value}")
+
+                            if field_type == "title":
+                                grouped[group_key]["title"] = simple_field_value
+                            elif field_type == "body":
+                                grouped[group_key]["body"] = simple_field_value
+                            elif field_type == "time":
+                                grouped[group_key]["send_time"] = simple_field_value
+                            elif field_type == "days":
+                                grouped[group_key]["days"] = simple_field_value
+                            continue
+
+                        notification_no = item.get("notification_id") or item_index
+                        title = item.get("title", "")
+                        body = item.get("body", "")
+                        send_time = item.get("send_time", "")
+                        schedule_type = item.get("schedule_type", "") or "Daily / Firebase configured"
+                        days = item.get("days", "")
+                        timezone = item.get("timezone", "")
+                        raw_item = item.get("raw_value", raw_value)
+
+                        rows.append(
+                            base
+                            + [
+                                "Remote Config",
+                                parameter_key,
+                                group_name,
+                                notification_no,
+                                title,
+                                body,
+                                send_time,
+                                schedule_type,
+                                days,
+                                timezone,
+                                value_source,
+                                value_type,
+                                value_row["condition_name"],
+                                value_row["condition_priority"],
+                                value_row["condition_expression"],
+                                experiment_id,
+                                variant_id,
+                                version_number,
+                                update_time,
+                                update_user,
+                                "SUCCESS",
+                                build_daily_notification_recommendation(title, body, send_time, raw_item),
+                                updated_at,
+                            ]
+                        )
+
+        for group_data in grouped.values():
+            parameter_keys = ", ".join(sorted(group_data["parameter_keys"]))
+            raw_values = " | ".join(group_data["raw_values"])
+            title = group_data.get("title", "")
+            body = group_data.get("body", "")
+            send_time = group_data.get("send_time", "")
+
+            rows.append(
+                base
+                + [
+                    "Remote Config",
+                    parameter_keys,
+                    group_data["group_name"],
+                    "Grouped",
+                    title,
+                    body,
+                    send_time,
+                    group_data.get("schedule_type", ""),
+                    group_data.get("days", ""),
+                    group_data.get("timezone", ""),
+                    group_data["value_source"],
+                    group_data["value_type"],
+                    group_data["condition_name"],
+                    group_data["condition_priority"],
+                    group_data["condition_expression"],
+                    group_data["experiment_id"],
+                    group_data["variant_id"],
+                    version_number,
+                    update_time,
+                    update_user,
+                    "SUCCESS",
+                    build_daily_notification_recommendation(title, body, send_time, raw_values),
+                    updated_at,
+                ]
+            )
+
+        if not matched_any:
+            search_note = ", ".join(explicit_keys) if explicit_keys else config.notification_parameter_keywords
+            rows.append(
+                make_daily_notification_empty_row(
+                    base,
+                    "NO NOTIFICATION CONFIG FOUND",
+                    f"No Remote Config parameter matched notification keys/keywords: {search_note}",
+                    updated_at,
+                    version_number,
+                    update_time,
+                    update_user,
+                )
+            )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            make_daily_notification_empty_row(
+                base,
+                status,
+                error_text,
+                updated_at,
+            )
+        )
+
+    return rows
+
+
+# =========================
+# GA4 NOTIFICATION EVENTS
+# =========================
+
+
+def get_notification_event_names() -> list[str]:
+    return split_csv(config.notification_event_names)
+
+
+def get_notification_event_filter() -> BetaFilterExpression:
+    return beta_or_filter(
+        [
+            beta_exact_filter("eventName", event_name)
+            for event_name in get_notification_event_names()
+        ]
+    )
+
+
+def run_ga4_notification_events_report(app: AppConfig):
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        dimensions=[
+            Dimension(name="eventName"),
+            Dimension(name="dateHourMinute"),
+        ],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="eventCount"),
+        ],
+        dimension_filter=get_notification_event_filter(),
+        limit=config.notification_event_limit,
+    )
+
+    return beta_client.run_report(request)
+
+
+def build_ga4_notification_event_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+
+    try:
+        response = run_ga4_notification_events_report(app)
+        dimension_headers = [header.name for header in response.dimension_headers]
+        metric_headers = [header.name for header in response.metric_headers]
+
+        if not response.rows:
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "NO NOTIFICATION EVENTS",
+                    "No notification_receive / notification_open / notification_dismiss / notification_foreground events found in GA4 for this date range.",
+                    updated_at,
+                ]
+            )
+            return rows
+
+        for row in response.rows:
+            row_data = {}
+
+            for index, dimension_value in enumerate(row.dimension_values):
+                row_data[dimension_headers[index]] = dimension_value.value
+
+            for index, metric_value in enumerate(row.metric_values):
+                row_data[metric_headers[index]] = metric_value.value
+
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    row_data.get("eventName", ""),
+                    row_data.get("dateHourMinute", ""),
+                    to_number(row_data.get("activeUsers", 0)),
+                    to_number(row_data.get("eventCount", 0)),
+                    "SUCCESS",
+                    "GA4 confirms FCM notification activity. Title/body text is not available here unless app logs it as registered custom dimensions.",
+                    updated_at,
+                ]
+            )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                "",
+                "",
+                "",
+                "",
+                status,
+                error_text,
+                updated_at,
+            ]
+        )
+
+    return rows
+
+
+# =========================
+# FCM DELIVERY DATA
+# =========================
+
+
+def get_notification_api_session():
+    global notification_api_session
+
+    if notification_api_session is None:
+        notification_api_session = AuthorizedSession(credentials)
+
+    return notification_api_session
+
+
+def format_fcm_date(date_data: dict) -> str:
+    year = int(date_data.get("year", 0) or 0)
+    month = int(date_data.get("month", 0) or 0)
+    day = int(date_data.get("day", 0) or 0)
+
+    if year and month and day:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    return json.dumps(date_data, ensure_ascii=False)
+
+
+def get_percent(data: dict, key: str):
+    value = data.get(key, "") if data else ""
+    if value in [None, ""]:
+        return ""
+    return f"{round(float(value), 2)}%"
+
+
+def make_fcm_delivery_empty_row(
+    base: list,
+    status: str,
+    message: str,
+    updated_at: str,
+) -> list:
+    return base + [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        status,
+        message,
+        updated_at,
+    ]
+
+
+def get_fcm_delivery_data(firebase_project_id: str, firebase_app_id: str) -> dict:
+    project_id = str(firebase_project_id).strip()
+    app_id = str(firebase_app_id).strip()
+
+    if not project_id:
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
+
+    if not app_id:
+        raise ValueError("Firebase App ID is empty in Apps Config.")
+
+    parent = f"projects/{project_id}/androidApps/{quote(app_id, safe='')}"
+    url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
+    response = get_notification_api_session().get(
+        url,
+        params={"pageSize": config.fcm_data_page_size},
+        timeout=config.firebase_remote_config_timeout,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"FCM Data API error {response.status_code}: {response.text}"
+        )
+
+    return response.json()
+
+
+def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+
+    base = [
+        app.app_name,
+        app.property_id,
+        app.firebase_project_id,
+        app.firebase_project_name,
+        app.firebase_app_id,
+        report_date_range,
+    ]
+
+    try:
+        response = get_fcm_delivery_data(app.firebase_project_id, app.firebase_app_id)
+        delivery_rows = response.get("androidDeliveryData", []) or []
+
+        if not delivery_rows:
+            rows.append(
+                make_fcm_delivery_empty_row(
+                    base,
+                    "NO FCM DELIVERY DATA",
+                    "No aggregate FCM delivery rows returned for this Firebase Android app.",
+                    updated_at,
+                )
+            )
+            return rows
+
+        for delivery in delivery_rows:
+            data = delivery.get("data", {}) or {}
+            outcome = data.get("messageOutcomePercents", {}) or {}
+            performance = data.get("deliveryPerformancePercents", {}) or {}
+            insight = data.get("messageInsightPercents", {}) or {}
+            proxy = data.get("proxyNotificationInsightPercents", {}) or {}
+
+            rows.append(
+                base
+                + [
+                    format_fcm_date(delivery.get("date", {}) or {}),
+                    delivery.get("analyticsLabel", ""),
+                    data.get("countMessagesAccepted", ""),
+                    data.get("countNotificationsAccepted", ""),
+                    get_percent(outcome, "delivered"),
+                    get_percent(outcome, "pending"),
+                    get_percent(outcome, "collapsed"),
+                    get_percent(outcome, "droppedTooManyPendingMessages"),
+                    get_percent(outcome, "droppedAppForceStopped"),
+                    get_percent(outcome, "droppedDeviceInactive"),
+                    get_percent(outcome, "droppedTtlExpired"),
+                    get_percent(performance, "deliveredNoDelay"),
+                    get_percent(performance, "delayedDeviceOffline"),
+                    get_percent(performance, "delayedDeviceDoze"),
+                    get_percent(performance, "delayedMessageThrottled"),
+                    get_percent(insight, "priorityLowered"),
+                    get_percent(proxy, "proxied"),
+                    "SUCCESS",
+                    "Aggregate FCM delivery data only. It does not include notification title/body text.",
+                    updated_at,
+                ]
+            )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            make_fcm_delivery_empty_row(
+                base,
+                status,
+                error_text,
+                updated_at,
+            )
+        )
+
+    return rows
+
 # =========================
 # MAIN
 # =========================
@@ -2262,6 +3162,86 @@ def main():
             "Template Version",
             "Last Published At",
             "Last Published By",
+            "Status",
+            "Recommendation / Error",
+            "Updated At",
+        ]
+    ]
+
+    daily_notifications_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Firebase Project ID",
+            "Firebase Project Name",
+            "Firebase App ID",
+            "Report Date Range",
+            "Source",
+            "Remote Config Parameter(s)",
+            "Parameter Group",
+            "Notification No",
+            "Notification Title",
+            "Notification Body / Content",
+            "Send Time",
+            "Schedule Type",
+            "Days / Repeat",
+            "Timezone",
+            "Value Source",
+            "Value Type",
+            "Condition / Audience",
+            "Condition Priority",
+            "Condition Expression",
+            "Experiment ID",
+            "Variant ID",
+            "Template Version",
+            "Last Published At",
+            "Last Published By",
+            "Status",
+            "Recommendation / Error",
+            "Updated At",
+        ]
+    ]
+
+    ga4_notification_event_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Report Date Range",
+            "Notification Event",
+            "GA4 Date Hour Minute",
+            "Active Users",
+            "Event Count",
+            "Status",
+            "Recommendation / Error",
+            "Updated At",
+        ]
+    ]
+
+    fcm_delivery_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Firebase Project ID",
+            "Firebase Project Name",
+            "Firebase App ID",
+            "Report Date Range",
+            "FCM Date",
+            "Analytics Label",
+            "Messages Accepted",
+            "Notifications Accepted",
+            "Delivered %",
+            "Pending %",
+            "Collapsed %",
+            "Dropped: Too Many Pending %",
+            "Dropped: App Force Stopped %",
+            "Dropped: Device Inactive %",
+            "Dropped: TTL Expired %",
+            "Delivered No Delay %",
+            "Delayed: Device Offline %",
+            "Delayed: Device Doze %",
+            "Delayed: Message Throttled %",
+            "Priority Lowered %",
+            "Proxied %",
             "Status",
             "Recommendation / Error",
             "Updated At",
@@ -2534,6 +3514,77 @@ def main():
                 ]
             )
 
+        # Firebase daily notifications from Remote Config
+        try:
+            app_daily_notification_rows = build_daily_notification_rows_for_app(app)
+            daily_notifications_rows.extend(app_daily_notification_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            daily_notifications_rows.append(
+                make_daily_notification_empty_row(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        app.firebase_project_id,
+                        app.firebase_project_name,
+                        app.firebase_app_id,
+                        report_date_range,
+                    ],
+                    status,
+                    error_text,
+                    now_text(),
+                )
+            )
+
+        # GA4 notification receive/open/dismiss events
+        try:
+            app_ga4_notification_rows = build_ga4_notification_event_rows_for_app(app)
+            ga4_notification_event_rows.extend(app_ga4_notification_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            ga4_notification_event_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+        # FCM aggregate delivery data
+        try:
+            app_fcm_delivery_rows = build_fcm_delivery_rows_for_app(app)
+            fcm_delivery_rows.extend(app_fcm_delivery_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            fcm_delivery_rows.append(
+                make_fcm_delivery_empty_row(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        app.firebase_project_id,
+                        app.firebase_project_name,
+                        app.firebase_app_id,
+                        report_date_range,
+                    ],
+                    status,
+                    error_text,
+                    now_text(),
+                )
+            )
+
     write_sheet(config.summary_sheet, funnel_summary_rows)
     write_sheet(config.details_sheet, funnel_details_rows)
     write_sheet(config.user_session_sheet, user_session_rows)
@@ -2542,6 +3593,9 @@ def main():
     write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
     write_sheet(config.remote_config_sheet, remote_config_rows)
     write_sheet(config.time_capping_ab_sheet, time_capping_ab_rows)
+    write_sheet(config.daily_notifications_sheet, daily_notifications_rows)
+    write_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows)
+    write_sheet(config.fcm_delivery_sheet, fcm_delivery_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -2552,6 +3606,9 @@ def main():
     print(f"Personalized User Experience: {config.personalized_ux_sheet}")
     print(f"Remote Configuration: {config.remote_config_sheet}")
     print(f"Firebase A/B Time Capping: {config.time_capping_ab_sheet}")
+    print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
+    print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
+    print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
