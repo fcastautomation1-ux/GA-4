@@ -43,6 +43,7 @@ jobs:
           DAILY_NOTIFICATIONS_SHEET: Firebase Daily Notifications
           GA4_NOTIFICATION_EVENTS_SHEET: GA4 Notification Events
           FCM_DELIVERY_SHEET: Firebase Notification Delivery
+          BIGQUERY_EXPORT_SHEET: BigQuery Unified Export
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
           REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
