@@ -6,6 +6,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/firebase.remoteconfig",
+    "https://www.googleapis.com/auth/cloud-platform",
 ]
 
 
@@ -50,6 +51,9 @@ class Config:
     personalized_ux_sheet: str
     remote_config_sheet: str
     time_capping_ab_sheet: str
+    daily_notifications_sheet: str
+    ga4_notification_events_sheet: str
+    fcm_delivery_sheet: str
 
     start_date: str
     end_date: str
@@ -67,6 +71,13 @@ class Config:
     remote_config_namespace: str
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
+
+    daily_notification_parameters: str
+    notification_parameter_keywords: str
+    notification_event_names: str
+    notification_event_limit: int
+    fcm_data_api_base: str
+    fcm_data_page_size: int
 
 
 def load_config() -> Config:
@@ -100,6 +111,18 @@ def load_config() -> Config:
         time_capping_ab_sheet=optional_env(
             "TIME_CAPPING_AB_SHEET",
             "Firebase AB Time Capping",
+        ),
+        daily_notifications_sheet=optional_env(
+            "DAILY_NOTIFICATIONS_SHEET",
+            "Firebase Daily Notifications",
+        ),
+        ga4_notification_events_sheet=optional_env(
+            "GA4_NOTIFICATION_EVENTS_SHEET",
+            "GA4 Notification Events",
+        ),
+        fcm_delivery_sheet=optional_env(
+            "FCM_DELIVERY_SHEET",
+            "Firebase Notification Delivery",
         ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
@@ -138,5 +161,30 @@ def load_config() -> Config:
         firebase_remote_config_timeout=optional_int_env(
             "FIREBASE_REMOTE_CONFIG_TIMEOUT",
             30,
+        ),
+
+        daily_notification_parameters=optional_env(
+            "DAILY_NOTIFICATION_PARAMETERS",
+            "",
+        ),
+        notification_parameter_keywords=optional_env(
+            "NOTIFICATION_PARAMETER_KEYWORDS",
+            "notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm",
+        ),
+        notification_event_names=optional_env(
+            "NOTIFICATION_EVENT_NAMES",
+            "notification_receive,notification_foreground,notification_open,notification_dismiss",
+        ),
+        notification_event_limit=optional_int_env(
+            "NOTIFICATION_EVENT_LIMIT",
+            500,
+        ),
+        fcm_data_api_base=optional_env(
+            "FCM_DATA_API_BASE",
+            "https://fcmdata.googleapis.com/v1beta1",
+        ),
+        fcm_data_page_size=optional_int_env(
+            "FCM_DATA_PAGE_SIZE",
+            1000,
         ),
     )
