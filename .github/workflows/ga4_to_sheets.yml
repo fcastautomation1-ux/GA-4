@@ -39,10 +39,14 @@ jobs:
           AUDIENCE_SEGMENTS_SHEET: GA4 Audience Segments
           PERSONALIZED_UX_SHEET: GA4 Personalized User Experience
           REMOTE_CONFIG_SHEET: GA4 Remote Configuration
+          TIME_CAPPING_AB_SHEET: Firebase AB Time Capping
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
           REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
           REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '10' }}
+          TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
+          REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
+          FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
           DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
