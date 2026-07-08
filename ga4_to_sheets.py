@@ -128,6 +128,138 @@ def write_sheet(sheet_name: str, rows: list[list]):
     ).execute()
 
 
+BIGQUERY_HEADER_ALIASES = {
+    "Date Range": "report_date_range",
+    "Report Date Range": "report_date_range",
+    "Recommendation / Error": "recommendation_or_error",
+    "Rule / Type": "rule_or_type",
+    "Notification Body / Content": "notification_body_content",
+    "Days / Repeat": "days_or_repeat",
+    "Condition / Variant": "condition_or_variant",
+    "Condition / Audience": "condition_or_audience",
+    "Dropped: Too Many Pending %": "dropped_too_many_pending_percent",
+    "Dropped: App Force Stopped %": "dropped_app_force_stopped_percent",
+    "Dropped: Device Inactive %": "dropped_device_inactive_percent",
+    "Dropped: TTL Expired %": "dropped_ttl_expired_percent",
+    "Delayed: Device Offline %": "delayed_device_offline_percent",
+    "Delayed: Device Doze %": "delayed_device_doze_percent",
+    "Delayed: Message Throttled %": "delayed_message_throttled_percent",
+}
+
+
+BIGQUERY_COMMON_COLUMNS = [
+    "app_name",
+    "property_id",
+    "firebase_project_id",
+    "firebase_project_name",
+    "firebase_app_id",
+    "report_date_range",
+    "source",
+    "status",
+    "error",
+    "recommendation_or_error",
+    "updated_at",
+]
+
+
+def clean_bigquery_column_name(header: str) -> str:
+    """Convert Google Sheet headers to BigQuery-safe snake_case column names."""
+    header = str(header or "").strip()
+
+    if header in BIGQUERY_HEADER_ALIASES:
+        return BIGQUERY_HEADER_ALIASES[header]
+
+    header = header.replace("%", " percent ")
+    header = header.replace("&", " and ")
+    header = header.replace("/", " or ")
+    header = header.replace("+", " plus ")
+    header = header.replace("-", " ")
+    header = header.replace(":", " ")
+
+    column_name = re.sub(r"[^0-9A-Za-z]+", "_", header).strip("_").lower()
+    column_name = re.sub(r"_+", "_", column_name)
+
+    if not column_name:
+        column_name = "field"
+
+    if column_name[0].isdigit():
+        column_name = f"col_{column_name}"
+
+    return column_name
+
+
+def normalize_report_type(report_name: str) -> str:
+    return clean_bigquery_column_name(report_name)
+
+
+def build_bigquery_unified_rows(reports: list[tuple[str, str, list[list]]]) -> list[list]:
+    """
+    Combine the existing report row arrays into one BigQuery-friendly tab.
+
+    This does not change any GA4/Firebase fetching, parsing, or calculation logic.
+    It only reshapes the already-created rows into one clean table with:
+    - one header row
+    - BigQuery-safe snake_case columns
+    - report_type/source_sheet columns so every row remains traceable
+    """
+    discovered_columns = []
+    normalized_reports = []
+
+    for report_name, source_sheet, rows in reports:
+        if not rows:
+            continue
+
+        source_headers = rows[0]
+        clean_headers = [clean_bigquery_column_name(header) for header in source_headers]
+
+        for column_name in clean_headers:
+            if column_name not in discovered_columns:
+                discovered_columns.append(column_name)
+
+        normalized_reports.append(
+            {
+                "report_type": normalize_report_type(report_name),
+                "source_sheet": source_sheet,
+                "headers": clean_headers,
+                "rows": rows[1:],
+            }
+        )
+
+    ordered_columns = []
+
+    for column_name in BIGQUERY_COMMON_COLUMNS:
+        if column_name in discovered_columns and column_name not in ordered_columns:
+            ordered_columns.append(column_name)
+
+    for column_name in discovered_columns:
+        if column_name not in ordered_columns:
+            ordered_columns.append(column_name)
+
+    final_headers = ["export_row_id", "report_type", "source_sheet"] + ordered_columns
+    final_rows = [final_headers]
+    export_row_id = 1
+
+    for report in normalized_reports:
+        for source_row in report["rows"]:
+            row_dict = {}
+
+            for index, header in enumerate(report["headers"]):
+                value = source_row[index] if index < len(source_row) else ""
+                row_dict[header] = value
+
+            final_rows.append(
+                [
+                    export_row_id,
+                    report["report_type"],
+                    report["source_sheet"],
+                ]
+                + [row_dict.get(column_name, "") for column_name in ordered_columns]
+            )
+            export_row_id += 1
+
+    return final_rows
+
+
 
 def get_apps_config_headers() -> list[str]:
     return [
@@ -2106,9 +2238,6 @@ def build_time_capping_ab_rows_for_app(app: AppConfig) -> list[list]:
     return rows
 
 
-
-
-# =========================
 # FIREBASE A/B TEST - IAP SCREEN / PAYWALL
 # =========================
 
@@ -4334,32 +4463,29 @@ def main():
                 )
             )
 
-    write_sheet(config.summary_sheet, funnel_summary_rows)
-    write_sheet(config.details_sheet, funnel_details_rows)
-    write_sheet(config.user_session_sheet, user_session_rows)
-    write_sheet(config.retention_details_sheet, retention_details_rows)
-    write_sheet(config.audience_segments_sheet, audience_segment_rows)
-    write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
-    write_sheet(config.remote_config_sheet, remote_config_rows)
-    write_sheet(config.time_capping_ab_sheet, time_capping_ab_rows)
-    write_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows)
-    write_sheet(config.daily_notifications_sheet, daily_notifications_rows)
-    write_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows)
-    write_sheet(config.fcm_delivery_sheet, fcm_delivery_rows)
+    bigquery_unified_rows = build_bigquery_unified_rows(
+        [
+            ("GA4 Funnel Summary", config.summary_sheet, funnel_summary_rows),
+            ("GA4 Funnel Details", config.details_sheet, funnel_details_rows),
+            ("GA4 User Session Summary", config.user_session_sheet, user_session_rows),
+            ("GA4 Retention Details", config.retention_details_sheet, retention_details_rows),
+            ("GA4 Audience Segments", config.audience_segments_sheet, audience_segment_rows),
+            ("GA4 Personalized User Experience", config.personalized_ux_sheet, personalized_ux_rows),
+            ("GA4 Remote Configuration", config.remote_config_sheet, remote_config_rows),
+            ("Firebase AB Time Capping", config.time_capping_ab_sheet, time_capping_ab_rows),
+            ("Firebase AB IAP Screen", config.iap_screen_ab_sheet, iap_screen_ab_rows),
+            ("Firebase Daily Notifications", config.daily_notifications_sheet, daily_notifications_rows),
+            ("GA4 Notification Events", config.ga4_notification_events_sheet, ga4_notification_event_rows),
+            ("Firebase Notification Delivery", config.fcm_delivery_sheet, fcm_delivery_rows),
+        ]
+    )
 
-    print("Done. All reports updated in Google Sheet.")
-    print(f"Funnel Summary: {config.summary_sheet}")
-    print(f"Funnel Details: {config.details_sheet}")
-    print(f"User Session Summary: {config.user_session_sheet}")
-    print(f"Retention Details: {config.retention_details_sheet}")
-    print(f"Audience Segments: {config.audience_segments_sheet}")
-    print(f"Personalized User Experience: {config.personalized_ux_sheet}")
-    print(f"Remote Configuration: {config.remote_config_sheet}")
-    print(f"Firebase A/B Time Capping: {config.time_capping_ab_sheet}")
-    print(f"Firebase A/B IAP Screen: {config.iap_screen_ab_sheet}")
-    print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
-    print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
-    print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
+    write_sheet(config.bigquery_export_sheet, bigquery_unified_rows)
+
+    print("Done. BigQuery unified export updated in Google Sheet.")
+    print(f"BigQuery Unified Export: {config.bigquery_export_sheet}")
+    print(f"Included Firebase A/B IAP Screen source: {config.iap_screen_ab_sheet}")
+    print(f"Rows exported: {len(bigquery_unified_rows) - 1}")
     print(f"Report Date Range: {report_date_range}")
 
 
