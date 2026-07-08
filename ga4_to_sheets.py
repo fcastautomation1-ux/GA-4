@@ -55,6 +55,7 @@ class AppConfig:
     firebase_app_id: str
     time_capping_parameter: str
     daily_notification_parameters: str
+    iap_screen_parameter: str
 
 
 def get_credentials():
@@ -127,138 +128,6 @@ def write_sheet(sheet_name: str, rows: list[list]):
     ).execute()
 
 
-BIGQUERY_HEADER_ALIASES = {
-    "Date Range": "report_date_range",
-    "Report Date Range": "report_date_range",
-    "Recommendation / Error": "recommendation_or_error",
-    "Rule / Type": "rule_or_type",
-    "Notification Body / Content": "notification_body_content",
-    "Days / Repeat": "days_or_repeat",
-    "Condition / Variant": "condition_or_variant",
-    "Condition / Audience": "condition_or_audience",
-    "Dropped: Too Many Pending %": "dropped_too_many_pending_percent",
-    "Dropped: App Force Stopped %": "dropped_app_force_stopped_percent",
-    "Dropped: Device Inactive %": "dropped_device_inactive_percent",
-    "Dropped: TTL Expired %": "dropped_ttl_expired_percent",
-    "Delayed: Device Offline %": "delayed_device_offline_percent",
-    "Delayed: Device Doze %": "delayed_device_doze_percent",
-    "Delayed: Message Throttled %": "delayed_message_throttled_percent",
-}
-
-
-BIGQUERY_COMMON_COLUMNS = [
-    "app_name",
-    "property_id",
-    "firebase_project_id",
-    "firebase_project_name",
-    "firebase_app_id",
-    "report_date_range",
-    "source",
-    "status",
-    "error",
-    "recommendation_or_error",
-    "updated_at",
-]
-
-
-def clean_bigquery_column_name(header: str) -> str:
-    """Convert Google Sheet headers to BigQuery-safe snake_case column names."""
-    header = str(header or "").strip()
-
-    if header in BIGQUERY_HEADER_ALIASES:
-        return BIGQUERY_HEADER_ALIASES[header]
-
-    header = header.replace("%", " percent ")
-    header = header.replace("&", " and ")
-    header = header.replace("/", " or ")
-    header = header.replace("+", " plus ")
-    header = header.replace("-", " ")
-    header = header.replace(":", " ")
-
-    column_name = re.sub(r"[^0-9A-Za-z]+", "_", header).strip("_").lower()
-    column_name = re.sub(r"_+", "_", column_name)
-
-    if not column_name:
-        column_name = "field"
-
-    if column_name[0].isdigit():
-        column_name = f"col_{column_name}"
-
-    return column_name
-
-
-def normalize_report_type(report_name: str) -> str:
-    return clean_bigquery_column_name(report_name)
-
-
-def build_bigquery_unified_rows(reports: list[tuple[str, str, list[list]]]) -> list[list]:
-    """
-    Combine the existing report row arrays into one BigQuery-friendly tab.
-
-    This does not change any GA4/Firebase fetching, parsing, or calculation logic.
-    It only reshapes the already-created rows into one clean table with:
-    - one header row
-    - BigQuery-safe snake_case columns
-    - report_type/source_sheet columns so every row remains traceable
-    """
-    discovered_columns = []
-    normalized_reports = []
-
-    for report_name, source_sheet, rows in reports:
-        if not rows:
-            continue
-
-        source_headers = rows[0]
-        clean_headers = [clean_bigquery_column_name(header) for header in source_headers]
-
-        for column_name in clean_headers:
-            if column_name not in discovered_columns:
-                discovered_columns.append(column_name)
-
-        normalized_reports.append(
-            {
-                "report_type": normalize_report_type(report_name),
-                "source_sheet": source_sheet,
-                "headers": clean_headers,
-                "rows": rows[1:],
-            }
-        )
-
-    ordered_columns = []
-
-    for column_name in BIGQUERY_COMMON_COLUMNS:
-        if column_name in discovered_columns and column_name not in ordered_columns:
-            ordered_columns.append(column_name)
-
-    for column_name in discovered_columns:
-        if column_name not in ordered_columns:
-            ordered_columns.append(column_name)
-
-    final_headers = ["export_row_id", "report_type", "source_sheet"] + ordered_columns
-    final_rows = [final_headers]
-    export_row_id = 1
-
-    for report in normalized_reports:
-        for source_row in report["rows"]:
-            row_dict = {}
-
-            for index, header in enumerate(report["headers"]):
-                value = source_row[index] if index < len(source_row) else ""
-                row_dict[header] = value
-
-            final_rows.append(
-                [
-                    export_row_id,
-                    report["report_type"],
-                    report["source_sheet"],
-                ]
-                + [row_dict.get(column_name, "") for column_name in ordered_columns]
-            )
-            export_row_id += 1
-
-    return final_rows
-
-
 
 def get_apps_config_headers() -> list[str]:
     return [
@@ -272,6 +141,7 @@ def get_apps_config_headers() -> list[str]:
         "Firebase App ID",
         "Time Capping Parameter",
         "Daily Notification Parameters",
+        "IAP Screen Parameter",
     ]
 
 
@@ -284,7 +154,7 @@ def ensure_apps_config_headers(service, values: list[list]):
 
     service.spreadsheets().values().update(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A1:J1",
+        range=f"{config.apps_config_sheet}!A1:K1",
         valueInputOption="USER_ENTERED",
         body={"values": [expected_headers]},
     ).execute()
@@ -305,6 +175,7 @@ def create_apps_config_template(service):
             "1:1234567890:android:abcdef123456",
             "ad_time_capping",
             "",
+            "iap_screen",
         ],
         [
             "TRUE",
@@ -317,6 +188,7 @@ def create_apps_config_template(service):
             "1:1234567890:android:abcdef123456",
             "ad_time_capping",
             "",
+            "iap_screen",
         ],
     ]
 
@@ -334,7 +206,7 @@ def read_apps_config() -> list[AppConfig]:
 
     response = service.spreadsheets().values().get(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A:J",
+        range=f"{config.apps_config_sheet}!A:K",
     ).execute()
 
     values = response.get("values", [])
@@ -379,6 +251,11 @@ def read_apps_config() -> list[AppConfig]:
             if len(row) > 9 and row[9].strip()
             else config.daily_notification_parameters
         )
+        iap_screen_parameter = (
+            row[10].strip()
+            if len(row) > 10 and row[10].strip()
+            else config.iap_screen_parameter
+        )
 
         if enabled not in ["TRUE", "YES", "1", "Y"]:
             continue
@@ -398,6 +275,7 @@ def read_apps_config() -> list[AppConfig]:
                 firebase_app_id=firebase_app_id,
                 time_capping_parameter=time_capping_parameter,
                 daily_notification_parameters=daily_notification_parameters,
+                iap_screen_parameter=iap_screen_parameter,
             )
         )
 
@@ -2228,6 +2106,373 @@ def build_time_capping_ab_rows_for_app(app: AppConfig) -> list[list]:
     return rows
 
 
+
+
+# =========================
+# FIREBASE A/B TEST - IAP SCREEN / PAYWALL
+# =========================
+
+
+def get_iap_screen_keywords() -> list[str]:
+    keywords = split_csv(getattr(config, "iap_screen_parameter_keywords", ""))
+    parameter_key = str(getattr(config, "iap_screen_parameter", "") or "").strip()
+
+    if parameter_key:
+        keywords.insert(0, parameter_key)
+
+    normalized = []
+    for keyword in keywords:
+        keyword = str(keyword).strip().lower()
+        if keyword and keyword not in normalized:
+            normalized.append(keyword)
+
+    return normalized
+
+
+def remote_config_key_matches_keywords(parameter_key: str, keywords: list[str]) -> bool:
+    key_lower = str(parameter_key or "").lower()
+    return any(keyword and keyword in key_lower for keyword in keywords)
+
+
+def find_iap_screen_remote_config_parameters(
+    template: dict,
+    parameter_key: str,
+) -> list[dict]:
+    matches = []
+    seen = set()
+
+    explicit_key = str(parameter_key or "").strip()
+    if explicit_key:
+        parameter, group_name, matched_key = find_remote_config_parameter(template, explicit_key)
+        if parameter is not None and matched_key:
+            matches.append(
+                {
+                    "parameter_key": matched_key,
+                    "parameter": parameter,
+                    "group_name": group_name,
+                    "match_rule": f"Exact / fallback match for {explicit_key}",
+                }
+            )
+            seen.add((group_name, matched_key))
+
+    keywords = get_iap_screen_keywords()
+    if explicit_key:
+        explicit_lower = explicit_key.lower()
+        if explicit_lower not in keywords:
+            keywords.insert(0, explicit_lower)
+
+    for candidate_key, parameter, group_name in iter_remote_config_parameters(template):
+        unique_key = (group_name, candidate_key)
+        if unique_key in seen:
+            continue
+
+        if remote_config_key_matches_keywords(candidate_key, keywords):
+            matches.append(
+                {
+                    "parameter_key": candidate_key,
+                    "parameter": parameter,
+                    "group_name": group_name,
+                    "match_rule": "IAP/paywall keyword match",
+                }
+            )
+            seen.add(unique_key)
+
+    return matches
+
+
+def build_iap_screen_recommendation(
+    value_source: str,
+    parameter_key: str,
+    value: str,
+    experiment_id: str = "",
+) -> str:
+    if experiment_id:
+        return (
+            f"IAP/paywall screen A/B value detected for {parameter_key}. Compare experiment ID "
+            f"({experiment_id}) with paywall views, purchase starts, purchases, trial starts, "
+            "ARPU/LTV, retention, and refund or cancellation signals."
+        )
+
+    if value_source == "Default value":
+        return (
+            f"Current default IAP/paywall screen value for {parameter_key} is {value}. "
+            "Use this as the control value when comparing new IAP screen tests."
+        )
+
+    if value_source == "Conditional value":
+        return (
+            f"Conditional IAP/paywall screen value found for {parameter_key}. "
+            "Check the condition audience before comparing purchase performance."
+        )
+
+    return "Review this Remote Config IAP/paywall screen row."
+
+
+def append_iap_screen_parameter_rows(
+    rows: list[list],
+    app: AppConfig,
+    report_date_range: str,
+    parameter_key: str,
+    parameter: dict,
+    group_name: str,
+    condition_lookup: dict,
+    condition_priority: dict,
+    version_number: str,
+    update_time: str,
+    update_user: str,
+    updated_at: str,
+):
+    value_type = parameter.get("valueType", "STRING")
+    default_value_object = parameter.get("defaultValue")
+    default_value = format_remote_config_value(default_value_object)
+
+    rows.append(
+        [
+            app.app_name,
+            app.property_id,
+            app.firebase_project_id,
+            app.firebase_project_name,
+            app.firebase_app_id,
+            report_date_range,
+            parameter_key,
+            group_name,
+            "Default value",
+            "Default",
+            default_value,
+            value_type,
+            "",
+            "",
+            "",
+            "",
+            version_number,
+            update_time,
+            update_user,
+            "SUCCESS",
+            build_iap_screen_recommendation("Default value", parameter_key, default_value),
+            updated_at,
+        ]
+    )
+
+    for experiment_row in extract_experiment_variant_rows(default_value_object):
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                app.firebase_project_id,
+                app.firebase_project_name,
+                app.firebase_app_id,
+                report_date_range,
+                parameter_key,
+                group_name,
+                "A/B Testing experiment value",
+                "Default experiment",
+                experiment_row["value"],
+                value_type,
+                "",
+                "",
+                experiment_row["experiment_id"],
+                experiment_row["variant_id"],
+                version_number,
+                update_time,
+                update_user,
+                "SUCCESS",
+                build_iap_screen_recommendation(
+                    "A/B Testing experiment value",
+                    parameter_key,
+                    experiment_row["value"],
+                    experiment_row["experiment_id"],
+                ),
+                updated_at,
+            ]
+        )
+
+    conditional_values = parameter.get("conditionalValues", {}) or {}
+
+    for condition_name, value_object in conditional_values.items():
+        condition = condition_lookup.get(condition_name, {}) or {}
+        condition_expression = condition.get("expression", "")
+        condition_value = format_remote_config_value(value_object)
+        priority = condition_priority.get(condition_name, "")
+
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                app.firebase_project_id,
+                app.firebase_project_name,
+                app.firebase_app_id,
+                report_date_range,
+                parameter_key,
+                group_name,
+                "Conditional value",
+                condition_name,
+                condition_value,
+                value_type,
+                priority,
+                condition_expression,
+                "",
+                "",
+                version_number,
+                update_time,
+                update_user,
+                "SUCCESS",
+                build_iap_screen_recommendation("Conditional value", parameter_key, condition_value),
+                updated_at,
+            ]
+        )
+
+        for experiment_row in extract_experiment_variant_rows(value_object):
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    app.firebase_project_id,
+                    app.firebase_project_name,
+                    app.firebase_app_id,
+                    report_date_range,
+                    parameter_key,
+                    group_name,
+                    "A/B Testing experiment value",
+                    condition_name,
+                    experiment_row["value"],
+                    value_type,
+                    priority,
+                    condition_expression,
+                    experiment_row["experiment_id"],
+                    experiment_row["variant_id"],
+                    version_number,
+                    update_time,
+                    update_user,
+                    "SUCCESS",
+                    build_iap_screen_recommendation(
+                        "A/B Testing experiment value",
+                        parameter_key,
+                        experiment_row["value"],
+                        experiment_row["experiment_id"],
+                    ),
+                    updated_at,
+                ]
+            )
+
+
+def build_iap_screen_ab_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+    parameter_key = app.iap_screen_parameter or config.iap_screen_parameter
+
+    base_prefix = [
+        app.app_name,
+        app.property_id,
+        app.firebase_project_id,
+        app.firebase_project_name,
+        app.firebase_app_id,
+        report_date_range,
+        parameter_key,
+    ]
+
+    if not app.firebase_project_id:
+        rows.append(
+            base_prefix
+            + [
+                "",
+                "A/B Test on IAPs Screen",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "MISSING FIREBASE PROJECT ID",
+                "Add Firebase Project ID in Apps Config column F.",
+                updated_at,
+            ]
+        )
+        return rows
+
+    try:
+        template, etag = get_firebase_remote_config_template(app.firebase_project_id)
+        condition_lookup, condition_priority = get_condition_lookup(template)
+        version = template.get("version", {}) or {}
+        version_number = version.get("versionNumber", "")
+        update_time = version.get("updateTime", "")
+        update_user = (version.get("updateUser", {}) or {}).get("email", "")
+
+        matches = find_iap_screen_remote_config_parameters(template, parameter_key)
+
+        if not matches:
+            keywords_used = ", ".join(get_iap_screen_keywords())
+            rows.append(
+                base_prefix
+                + [
+                    "",
+                    "A/B Test on IAPs Screen",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    version_number,
+                    update_time,
+                    update_user,
+                    "NO IAP SCREEN CONFIG FOUND",
+                    (
+                        f"Parameter {parameter_key} was not found in Firebase Remote Config, "
+                        f"and no parameter matched IAP/paywall keywords: {keywords_used}. "
+                        "Add the exact key in Apps Config column K if your app uses a different Remote Config key."
+                    ),
+                    updated_at,
+                ]
+            )
+            return rows
+
+        for match in matches:
+            append_iap_screen_parameter_rows(
+                rows=rows,
+                app=app,
+                report_date_range=report_date_range,
+                parameter_key=match["parameter_key"],
+                parameter=match["parameter"],
+                group_name=match["group_name"],
+                condition_lookup=condition_lookup,
+                condition_priority=condition_priority,
+                version_number=version_number,
+                update_time=update_time,
+                update_user=update_user,
+                updated_at=updated_at,
+            )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            base_prefix
+            + [
+                "",
+                "A/B Test on IAPs Screen",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                status,
+                error_text,
+                updated_at,
+            ]
+        )
+
+    return rows
+
 # =========================
 # DAILY NOTIFICATIONS
 # =========================
@@ -3343,6 +3588,7 @@ def get_fcm_delivery_data(firebase_project_id: str, firebase_app_id: str) -> dic
         firebase_app_id=firebase_app_id,
         time_capping_parameter="",
         daily_notification_parameters="",
+        iap_screen_parameter="",
     )
     return get_fcm_delivery_data_for_app(temp_app)
 
@@ -3583,6 +3829,33 @@ def main():
     ]
 
     time_capping_ab_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Firebase Project ID",
+            "Firebase Project Name",
+            "Firebase App ID",
+            "Report Date Range",
+            "Remote Config Parameter",
+            "Parameter Group",
+            "Value Source",
+            "Condition / Variant",
+            "Remote Config Value",
+            "Value Type",
+            "Condition Priority",
+            "Condition Expression",
+            "Experiment ID",
+            "Variant ID",
+            "Template Version",
+            "Last Published At",
+            "Last Published By",
+            "Status",
+            "Recommendation / Error",
+            "Updated At",
+        ]
+    ]
+
+    iap_screen_ab_rows = [
         [
             "App Name",
             "Property ID",
@@ -3955,6 +4228,41 @@ def main():
                 ]
             )
 
+        # Firebase A/B test on IAP/paywall screen from Remote Config
+        try:
+            app_iap_screen_rows = build_iap_screen_ab_rows_for_app(app)
+            iap_screen_ab_rows.extend(app_iap_screen_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            iap_screen_ab_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    app.firebase_project_id,
+                    app.firebase_project_name,
+                    app.firebase_app_id,
+                    report_date_range,
+                    app.iap_screen_parameter,
+                    "",
+                    "A/B Test on IAPs Screen",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
         # Firebase daily notifications from Remote Config
         try:
             app_daily_notification_rows = build_daily_notification_rows_for_app(app)
@@ -4026,27 +4334,32 @@ def main():
                 )
             )
 
-    bigquery_unified_rows = build_bigquery_unified_rows(
-        [
-            ("GA4 Funnel Summary", config.summary_sheet, funnel_summary_rows),
-            ("GA4 Funnel Details", config.details_sheet, funnel_details_rows),
-            ("GA4 User Session Summary", config.user_session_sheet, user_session_rows),
-            ("GA4 Retention Details", config.retention_details_sheet, retention_details_rows),
-            ("GA4 Audience Segments", config.audience_segments_sheet, audience_segment_rows),
-            ("GA4 Personalized User Experience", config.personalized_ux_sheet, personalized_ux_rows),
-            ("GA4 Remote Configuration", config.remote_config_sheet, remote_config_rows),
-            ("Firebase AB Time Capping", config.time_capping_ab_sheet, time_capping_ab_rows),
-            ("Firebase Daily Notifications", config.daily_notifications_sheet, daily_notifications_rows),
-            ("GA4 Notification Events", config.ga4_notification_events_sheet, ga4_notification_event_rows),
-            ("Firebase Notification Delivery", config.fcm_delivery_sheet, fcm_delivery_rows),
-        ]
-    )
+    write_sheet(config.summary_sheet, funnel_summary_rows)
+    write_sheet(config.details_sheet, funnel_details_rows)
+    write_sheet(config.user_session_sheet, user_session_rows)
+    write_sheet(config.retention_details_sheet, retention_details_rows)
+    write_sheet(config.audience_segments_sheet, audience_segment_rows)
+    write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
+    write_sheet(config.remote_config_sheet, remote_config_rows)
+    write_sheet(config.time_capping_ab_sheet, time_capping_ab_rows)
+    write_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows)
+    write_sheet(config.daily_notifications_sheet, daily_notifications_rows)
+    write_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows)
+    write_sheet(config.fcm_delivery_sheet, fcm_delivery_rows)
 
-    write_sheet(config.bigquery_export_sheet, bigquery_unified_rows)
-
-    print("Done. BigQuery unified export updated in Google Sheet.")
-    print(f"BigQuery Unified Export: {config.bigquery_export_sheet}")
-    print(f"Rows exported: {len(bigquery_unified_rows) - 1}")
+    print("Done. All reports updated in Google Sheet.")
+    print(f"Funnel Summary: {config.summary_sheet}")
+    print(f"Funnel Details: {config.details_sheet}")
+    print(f"User Session Summary: {config.user_session_sheet}")
+    print(f"Retention Details: {config.retention_details_sheet}")
+    print(f"Audience Segments: {config.audience_segments_sheet}")
+    print(f"Personalized User Experience: {config.personalized_ux_sheet}")
+    print(f"Remote Configuration: {config.remote_config_sheet}")
+    print(f"Firebase A/B Time Capping: {config.time_capping_ab_sheet}")
+    print(f"Firebase A/B IAP Screen: {config.iap_screen_ab_sheet}")
+    print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
+    print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
+    print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
