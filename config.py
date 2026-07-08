@@ -77,6 +77,7 @@ class Config:
     notification_event_names: str
     notification_event_limit: int
     fcm_data_api_base: str
+    firebase_management_api_base: str
     fcm_data_page_size: int
 
 
@@ -182,6 +183,10 @@ def load_config() -> Config:
         fcm_data_api_base=optional_env(
             "FCM_DATA_API_BASE",
             "https://fcmdata.googleapis.com/v1beta1",
+        ),
+        firebase_management_api_base=optional_env(
+            "FIREBASE_MANAGEMENT_API_BASE",
+            "https://firebase.googleapis.com/v1beta1",
         ),
         fcm_data_page_size=optional_int_env(
             "FCM_DATA_PAGE_SIZE",
