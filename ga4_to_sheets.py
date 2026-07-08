@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession
 
 from google.analytics.data_v1alpha import AlphaAnalyticsDataClient
 from google.analytics.data_v1alpha.types import (
@@ -48,6 +49,10 @@ class AppConfig:
     property_id: str
     home_screen_name: str
     screen_field: str
+    firebase_project_id: str
+    firebase_project_name: str
+    firebase_app_id: str
+    time_capping_parameter: str
 
 
 def get_credentials():
@@ -63,6 +68,7 @@ credentials = get_credentials()
 
 alpha_client = AlphaAnalyticsDataClient(credentials=credentials)
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
+remote_config_session = None
 
 
 def get_sheets_service():
@@ -119,23 +125,50 @@ def write_sheet(sheet_name: str, rows: list[list]):
     ).execute()
 
 
+
+def get_apps_config_headers() -> list[str]:
+    return [
+        "Enabled",
+        "App Name",
+        "Property ID",
+        "Home Screen Name",
+        "Screen Field",
+        "Firebase Project ID",
+        "Firebase Project Name",
+        "Firebase App ID",
+        "Time Capping Parameter",
+    ]
+
+
+def ensure_apps_config_headers(service, values: list[list]):
+    expected_headers = get_apps_config_headers()
+    current_headers = values[0] if values else []
+
+    if current_headers[: len(expected_headers)] == expected_headers:
+        return
+
+    service.spreadsheets().values().update(
+        spreadsheetId=config.spreadsheet_id,
+        range=f"{config.apps_config_sheet}!A1:I1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [expected_headers]},
+    ).execute()
+
 def create_apps_config_template(service):
     ensure_sheet_exists(service, config.apps_config_sheet)
 
     rows = [
-        [
-            "Enabled",
-            "App Name",
-            "Property ID",
-            "Home Screen Name",
-            "Screen Field",
-        ],
+        get_apps_config_headers(),
         [
             "TRUE",
             "ai-voice-generator-b2073",
             "498019838",
             "MainActivity",
             "unifiedPagePathScreen",
+            "your-firebase-project-id",
+            "Your Firebase Project Name",
+            "1:1234567890:android:abcdef123456",
+            "ad_time_capping",
         ],
         [
             "TRUE",
@@ -143,6 +176,10 @@ def create_apps_config_template(service):
             "504100281",
             "MainActivity",
             "unifiedPagePathScreen",
+            "antivirus-vibrant-soft",
+            "Antivirus vibrant soft",
+            "1:1234567890:android:abcdef123456",
+            "ad_time_capping",
         ],
     ]
 
@@ -160,7 +197,7 @@ def read_apps_config() -> list[AppConfig]:
 
     response = service.spreadsheets().values().get(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A:E",
+        range=f"{config.apps_config_sheet}!A:I",
     ).execute()
 
     values = response.get("values", [])
@@ -170,6 +207,8 @@ def read_apps_config() -> list[AppConfig]:
         raise SystemExit(
             "Apps Config sheet was empty. Template created. Fill apps and run again."
         )
+
+    ensure_apps_config_headers(service, values)
 
     apps = []
 
@@ -190,6 +229,15 @@ def read_apps_config() -> list[AppConfig]:
             else config.default_screen_field
         )
 
+        firebase_project_id = row[5].strip() if len(row) > 5 else ""
+        firebase_project_name = row[6].strip() if len(row) > 6 else ""
+        firebase_app_id = row[7].strip() if len(row) > 7 else ""
+        time_capping_parameter = (
+            row[8].strip()
+            if len(row) > 8 and row[8].strip()
+            else config.time_capping_parameter
+        )
+
         if enabled not in ["TRUE", "YES", "1", "Y"]:
             continue
 
@@ -203,6 +251,10 @@ def read_apps_config() -> list[AppConfig]:
                 property_id=property_id,
                 home_screen_name=home_screen_name,
                 screen_field=screen_field,
+                firebase_project_id=firebase_project_id,
+                firebase_project_name=firebase_project_name,
+                firebase_app_id=firebase_app_id,
+                time_capping_parameter=time_capping_parameter,
             )
         )
 
@@ -346,6 +398,17 @@ def classify_api_error(error) -> tuple[str, str]:
         "property not found",
         "invalid property",
     ]
+
+    api_not_enabled_keywords = [
+        "api has not been used",
+        "has not been enabled",
+        "enable it by visiting",
+        "service disabled",
+        "api disabled",
+    ]
+
+    if any(keyword in error_lower for keyword in api_not_enabled_keywords):
+        return "API NOT ENABLED", error_text
 
     if any(keyword in error_lower for keyword in no_access_keywords):
         return "NO ACCESS", error_text
@@ -1599,6 +1662,425 @@ def build_remote_config_rows_for_app(app: AppConfig) -> list[list]:
     return rows
 
 
+
+# =========================
+# FIREBASE A/B TEST - TIME CAPPING
+# =========================
+
+
+def get_remote_config_session():
+    global remote_config_session
+
+    if remote_config_session is None:
+        remote_config_session = AuthorizedSession(credentials)
+
+    return remote_config_session
+
+
+def get_firebase_remote_config_template(firebase_project_id: str) -> tuple[dict, str]:
+    project_id = str(firebase_project_id).strip()
+
+    if not project_id:
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
+
+    project_path = f"projects/{project_id}"
+    url = f"{config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
+    params = {}
+
+    namespace = str(config.remote_config_namespace).strip()
+    if namespace:
+        params["name"] = f"{project_path}/namespaces/{namespace}/remoteConfig"
+
+    response = get_remote_config_session().get(
+        url,
+        params=params,
+        headers={"Accept-Encoding": "gzip"},
+        timeout=config.firebase_remote_config_timeout,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Firebase Remote Config API error {response.status_code}: {response.text}"
+        )
+
+    return response.json(), response.headers.get("ETag", "")
+
+
+def find_remote_config_parameter(template: dict, parameter_key: str) -> tuple[dict | None, str, str]:
+    key = str(parameter_key).strip()
+
+    if not key:
+        return None, "", ""
+
+    parameters = template.get("parameters", {}) or {}
+
+    if key in parameters:
+        return parameters[key], "", key
+
+    parameter_groups = template.get("parameterGroups", {}) or {}
+
+    for group_name, group_data in parameter_groups.items():
+        group_parameters = group_data.get("parameters", {}) or {}
+        if key in group_parameters:
+            return group_parameters[key], group_name, key
+
+    # Helpful fallback: find capping-like parameters if the exact key is not found.
+    key_lower = key.lower()
+    for candidate_key, parameter in parameters.items():
+        if key_lower in candidate_key.lower() or candidate_key.lower() in key_lower:
+            return parameter, "", candidate_key
+
+    for group_name, group_data in parameter_groups.items():
+        group_parameters = group_data.get("parameters", {}) or {}
+        for candidate_key, parameter in group_parameters.items():
+            if key_lower in candidate_key.lower() or candidate_key.lower() in key_lower:
+                return parameter, group_name, candidate_key
+
+    return None, "", ""
+
+
+def get_condition_lookup(template: dict) -> tuple[dict, dict]:
+    condition_lookup = {}
+    condition_priority = {}
+
+    for index, condition in enumerate(template.get("conditions", []) or [], start=1):
+        name = condition.get("name", "")
+        if not name:
+            continue
+
+        condition_lookup[name] = condition
+        condition_priority[name] = index
+
+    return condition_lookup, condition_priority
+
+
+def format_remote_config_value(value_object: dict | None) -> str:
+    if not value_object:
+        return ""
+
+    if "value" in value_object:
+        return str(value_object.get("value", ""))
+
+    if value_object.get("useInAppDefault") is True:
+        return "Use in-app default"
+
+    if "personalizationValue" in value_object:
+        personalization = value_object.get("personalizationValue", {}) or {}
+        personalization_id = personalization.get("personalizationId", "")
+        return f"Personalization value: {personalization_id}" if personalization_id else "Personalization value"
+
+    if "experimentValue" in value_object:
+        experiment = value_object.get("experimentValue", {}) or {}
+        experiment_id = experiment.get("experimentId", "")
+        variants = []
+
+        for variant in experiment.get("variantValue", []) or []:
+            variant_id = variant.get("variantId", "")
+            if "value" in variant:
+                variant_value = variant.get("value", "")
+            elif variant.get("noChange") is True:
+                variant_value = "No change"
+            else:
+                variant_value = ""
+
+            variants.append(f"{variant_id}: {variant_value}" if variant_id else str(variant_value))
+
+        prefix = f"Experiment {experiment_id}" if experiment_id else "Experiment value"
+        return f"{prefix} | " + "; ".join(variants) if variants else prefix
+
+    if "rolloutValue" in value_object:
+        rollout = value_object.get("rolloutValue", {}) or {}
+        rollout_id = rollout.get("rolloutId", "")
+        rollout_value = rollout.get("value", "")
+        rollout_percent = rollout.get("percent", "")
+        return f"Rollout {rollout_id}: {rollout_value} to {rollout_percent}%"
+
+    return json.dumps(value_object, ensure_ascii=False)
+
+
+def extract_experiment_variant_rows(value_object: dict | None) -> list[dict]:
+    if not value_object or "experimentValue" not in value_object:
+        return []
+
+    experiment = value_object.get("experimentValue", {}) or {}
+    experiment_id = experiment.get("experimentId", "")
+    rows = []
+
+    for variant in experiment.get("variantValue", []) or []:
+        if "value" in variant:
+            variant_value = variant.get("value", "")
+        elif variant.get("noChange") is True:
+            variant_value = "No change"
+        else:
+            variant_value = ""
+
+        rows.append(
+            {
+                "experiment_id": experiment_id,
+                "variant_id": variant.get("variantId", ""),
+                "value": variant_value,
+            }
+        )
+
+    return rows
+
+
+def build_time_capping_recommendation(
+    value_source: str,
+    parameter_key: str,
+    value: str,
+    experiment_id: str = "",
+) -> str:
+    if experiment_id:
+        return (
+            f"A/B Testing value detected for {parameter_key}. Compare this experiment ID "
+            f"({experiment_id}) with GA4 funnel, retention, ARPU/ad revenue, and engagement."
+        )
+
+    if value_source == "Default value":
+        return (
+            f"Current default time capping for {parameter_key} is {value}. "
+            "Use this as the control value when comparing new capping tests."
+        )
+
+    if value_source == "Conditional value":
+        return (
+            f"Conditional time capping value found for {parameter_key}. "
+            "Check the condition audience before comparing performance."
+        )
+
+    return "Review this Remote Config time capping row."
+
+
+def build_time_capping_ab_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+    updated_at = now_text()
+    parameter_key = app.time_capping_parameter or config.time_capping_parameter
+
+    base_prefix = [
+        app.app_name,
+        app.property_id,
+        app.firebase_project_id,
+        app.firebase_project_name,
+        app.firebase_app_id,
+        report_date_range,
+        parameter_key,
+    ]
+
+    if not app.firebase_project_id:
+        rows.append(
+            base_prefix
+            + [
+                "",
+                "A/B Test on Time Capping",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "MISSING FIREBASE PROJECT ID",
+                "Add Firebase Project ID in Apps Config column F.",
+                updated_at,
+            ]
+        )
+        return rows
+
+    try:
+        template, etag = get_firebase_remote_config_template(app.firebase_project_id)
+        condition_lookup, condition_priority = get_condition_lookup(template)
+        parameter, group_name, matched_key = find_remote_config_parameter(template, parameter_key)
+        version = template.get("version", {}) or {}
+
+        version_number = version.get("versionNumber", "")
+        update_time = version.get("updateTime", "")
+        update_user = (version.get("updateUser", {}) or {}).get("email", "")
+
+        if parameter is None:
+            rows.append(
+                base_prefix
+                + [
+                    "",
+                    "A/B Test on Time Capping",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    version_number,
+                    update_time,
+                    update_user,
+                    "PARAMETER NOT FOUND",
+                    f"Parameter {parameter_key} was not found in Firebase Remote Config.",
+                    updated_at,
+                ]
+            )
+            return rows
+
+        value_type = parameter.get("valueType", "STRING")
+        default_value_object = parameter.get("defaultValue")
+        default_value = format_remote_config_value(default_value_object)
+
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                app.firebase_project_id,
+                app.firebase_project_name,
+                app.firebase_app_id,
+                report_date_range,
+                matched_key,
+                group_name,
+                "Default value",
+                "Default",
+                default_value,
+                value_type,
+                "",
+                "",
+                "",
+                "",
+                version_number,
+                update_time,
+                update_user,
+                "SUCCESS",
+                build_time_capping_recommendation("Default value", matched_key, default_value),
+                updated_at,
+            ]
+        )
+
+        for experiment_row in extract_experiment_variant_rows(default_value_object):
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    app.firebase_project_id,
+                    app.firebase_project_name,
+                    app.firebase_app_id,
+                    report_date_range,
+                    matched_key,
+                    group_name,
+                    "A/B Testing experiment value",
+                    "Default experiment",
+                    experiment_row["value"],
+                    value_type,
+                    "",
+                    experiment_row["experiment_id"],
+                    experiment_row["variant_id"],
+                    "",
+                    version_number,
+                    update_time,
+                    update_user,
+                    "SUCCESS",
+                    build_time_capping_recommendation(
+                        "A/B Testing experiment value",
+                        matched_key,
+                        experiment_row["value"],
+                        experiment_row["experiment_id"],
+                    ),
+                    updated_at,
+                ]
+            )
+
+        conditional_values = parameter.get("conditionalValues", {}) or {}
+
+        for condition_name, value_object in conditional_values.items():
+            condition = condition_lookup.get(condition_name, {}) or {}
+            condition_expression = condition.get("expression", "")
+            condition_value = format_remote_config_value(value_object)
+            priority = condition_priority.get(condition_name, "")
+
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    app.firebase_project_id,
+                    app.firebase_project_name,
+                    app.firebase_app_id,
+                    report_date_range,
+                    matched_key,
+                    group_name,
+                    "Conditional value",
+                    condition_name,
+                    condition_value,
+                    value_type,
+                    priority,
+                    condition_expression,
+                    "",
+                    "",
+                    version_number,
+                    update_time,
+                    update_user,
+                    "SUCCESS",
+                    build_time_capping_recommendation("Conditional value", matched_key, condition_value),
+                    updated_at,
+                ]
+            )
+
+            for experiment_row in extract_experiment_variant_rows(value_object):
+                rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        app.firebase_project_id,
+                        app.firebase_project_name,
+                        app.firebase_app_id,
+                        report_date_range,
+                        matched_key,
+                        group_name,
+                        "A/B Testing experiment value",
+                        condition_name,
+                        experiment_row["value"],
+                        value_type,
+                        priority,
+                        condition_expression,
+                        experiment_row["experiment_id"],
+                        experiment_row["variant_id"],
+                        version_number,
+                        update_time,
+                        update_user,
+                        "SUCCESS",
+                        build_time_capping_recommendation(
+                            "A/B Testing experiment value",
+                            matched_key,
+                            experiment_row["value"],
+                            experiment_row["experiment_id"],
+                        ),
+                        updated_at,
+                    ]
+                )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            base_prefix
+            + [
+                "",
+                "A/B Test on Time Capping",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                status,
+                error_text,
+                updated_at,
+            ]
+        )
+
+    return rows
+
 # =========================
 # MAIN
 # =========================
@@ -1753,6 +2235,33 @@ def main():
             "Sessions",
             "Avg Session Duration",
             "Event Count",
+            "Status",
+            "Recommendation / Error",
+            "Updated At",
+        ]
+    ]
+
+    time_capping_ab_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Firebase Project ID",
+            "Firebase Project Name",
+            "Firebase App ID",
+            "Report Date Range",
+            "Remote Config Parameter",
+            "Parameter Group",
+            "Value Source",
+            "Condition / Variant",
+            "Remote Config Value",
+            "Value Type",
+            "Condition Priority",
+            "Condition Expression",
+            "Experiment ID",
+            "Variant ID",
+            "Template Version",
+            "Last Published At",
+            "Last Published By",
             "Status",
             "Recommendation / Error",
             "Updated At",
@@ -1990,6 +2499,41 @@ def main():
                 ]
             )
 
+        # Firebase A/B test on time capping from Remote Config
+        try:
+            app_time_capping_rows = build_time_capping_ab_rows_for_app(app)
+            time_capping_ab_rows.extend(app_time_capping_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            time_capping_ab_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    app.firebase_project_id,
+                    app.firebase_project_name,
+                    app.firebase_app_id,
+                    report_date_range,
+                    app.time_capping_parameter,
+                    "",
+                    "A/B Test on Time Capping",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
     write_sheet(config.summary_sheet, funnel_summary_rows)
     write_sheet(config.details_sheet, funnel_details_rows)
     write_sheet(config.user_session_sheet, user_session_rows)
@@ -1997,6 +2541,7 @@ def main():
     write_sheet(config.audience_segments_sheet, audience_segment_rows)
     write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
     write_sheet(config.remote_config_sheet, remote_config_rows)
+    write_sheet(config.time_capping_ab_sheet, time_capping_ab_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -2006,6 +2551,7 @@ def main():
     print(f"Audience Segments: {config.audience_segments_sheet}")
     print(f"Personalized User Experience: {config.personalized_ux_sheet}")
     print(f"Remote Configuration: {config.remote_config_sheet}")
+    print(f"Firebase A/B Time Capping: {config.time_capping_ab_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
