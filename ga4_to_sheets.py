@@ -482,7 +482,30 @@ def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
         return package_name_cache[cache_key]
 
     try:
-        streams = fetch_ga4_data_streams(property_id)
+        url = f"{config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
+        params = {"pageSize": 200}
+        streams = []
+
+        while True:
+            response = get_analytics_admin_session().get(
+                url,
+                params=params,
+                timeout=30,
+            )
+
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"GA4 Admin API error {response.status_code}: {response.text}"
+                )
+
+            payload = response.json()
+            streams.extend(payload.get("dataStreams", []) or [])
+
+            next_page_token = payload.get("nextPageToken", "")
+            if not next_page_token:
+                break
+
+            params["pageToken"] = next_page_token
 
         android_streams = [
             stream
@@ -515,309 +538,6 @@ def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
         print(f"PACKAGE NAME {status} for property {property_id}: {error_text}")
         package_name_cache[cache_key] = ""
         return ""
-
-
-# =========================
-# AUTO DISCOVER ACCESSIBLE APPS
-# =========================
-
-
-def extract_id_from_resource_name(resource_name: str) -> str:
-    value = str(resource_name or "").strip()
-    if "/" not in value:
-        return value
-    return value.rstrip("/").split("/")[-1]
-
-
-def fetch_ga4_data_streams(property_id: str) -> list[dict]:
-    property_id = str(property_id or "").strip()
-    if not property_id:
-        return []
-
-    url = f"{config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
-    params = {"pageSize": 200}
-    streams = []
-
-    while True:
-        response = get_analytics_admin_session().get(
-            url,
-            params=params,
-            timeout=30,
-        )
-
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"GA4 Admin API error {response.status_code}: {response.text}"
-            )
-
-        payload = response.json()
-        streams.extend(payload.get("dataStreams", []) or [])
-
-        next_page_token = payload.get("nextPageToken", "")
-        if not next_page_token:
-            break
-
-        params["pageToken"] = next_page_token
-
-    return streams
-
-
-def list_accessible_ga4_properties() -> list[dict]:
-    url = f"{config.ga4_admin_api_base}/accountSummaries"
-    params = {"pageSize": 200}
-    properties = []
-    seen = set()
-
-    while True:
-        response = get_analytics_admin_session().get(
-            url,
-            params=params,
-            timeout=30,
-        )
-
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"GA4 Admin API error {response.status_code}: {response.text}"
-            )
-
-        payload = response.json()
-
-        for account_summary in payload.get("accountSummaries", []) or []:
-            account_name = account_summary.get("name", "")
-            account_display_name = account_summary.get("displayName", "")
-
-            for property_summary in account_summary.get("propertySummaries", []) or []:
-                property_resource = property_summary.get("property", "")
-                property_id = extract_id_from_resource_name(property_resource)
-
-                if not property_id or property_id in seen:
-                    continue
-
-                seen.add(property_id)
-                properties.append(
-                    {
-                        "property_id": property_id,
-                        "property_resource": property_resource,
-                        "property_display_name": property_summary.get("displayName", ""),
-                        "property_type": property_summary.get("propertyType", ""),
-                        "account_name": account_name,
-                        "account_display_name": account_display_name,
-                    }
-                )
-
-        next_page_token = payload.get("nextPageToken", "")
-        if not next_page_token:
-            break
-
-        params["pageToken"] = next_page_token
-
-    return properties
-
-
-def list_accessible_firebase_projects() -> list[dict]:
-    url = f"{config.firebase_management_api_base}/projects"
-    params = {"pageSize": 100}
-    projects = []
-    seen = set()
-
-    while True:
-        response = get_notification_api_session().get(
-            url,
-            params=params,
-            timeout=config.firebase_remote_config_timeout,
-        )
-
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Firebase Management API error {response.status_code}: {response.text}"
-            )
-
-        payload = response.json()
-        project_rows = payload.get("results", []) or payload.get("projects", []) or []
-
-        for project in project_rows:
-            project_id = project.get("projectId", "") or extract_id_from_resource_name(project.get("name", ""))
-            if not project_id or project_id in seen:
-                continue
-
-            seen.add(project_id)
-            projects.append(project)
-
-        next_page_token = payload.get("nextPageToken", "")
-        if not next_page_token:
-            break
-
-        params["pageToken"] = next_page_token
-
-    return projects
-
-
-def normalise_lookup_key(value: str) -> str:
-    return str(value or "").strip().lower()
-
-
-def add_firebase_app_to_index(index: dict[str, dict], key: str, app: dict):
-    key = normalise_lookup_key(key)
-    if key and key not in index:
-        index[key] = app
-
-
-def build_accessible_firebase_android_app_index() -> dict[str, dict]:
-    index = {}
-
-    try:
-        projects = list_accessible_firebase_projects()
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FIREBASE PROJECT DISCOVERY {status}: {error_text}")
-        return index
-
-    print(f"Accessible Firebase projects found: {len(projects)}")
-
-    for project in projects:
-        project_id = project.get("projectId", "") or extract_id_from_resource_name(project.get("name", ""))
-        project_display_name = project.get("displayName", "") or project_id
-
-        if not project_id:
-            continue
-
-        try:
-            android_apps = list_firebase_android_apps(project_id)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(f"FIREBASE ANDROID APP DISCOVERY {status} for {project_id}: {error_text}")
-            continue
-
-        for android_app in android_apps:
-            enriched_app = dict(android_app)
-            enriched_app["_firebase_project_id"] = project_id
-            enriched_app["_firebase_project_name"] = project_display_name
-
-            add_firebase_app_to_index(index, enriched_app.get("appId", ""), enriched_app)
-            add_firebase_app_to_index(index, enriched_app.get("packageName", ""), enriched_app)
-            add_firebase_app_to_index(index, enriched_app.get("displayName", ""), enriched_app)
-
-    return index
-
-
-def is_android_stream(stream: dict) -> bool:
-    return bool(get_android_package_name_from_stream(stream) or get_firebase_app_id_from_stream(stream))
-
-
-def get_stream_display_name(stream: dict) -> str:
-    return str(stream.get("displayName", "") or "").strip()
-
-
-def choose_firebase_app_for_ga4_streams(android_streams: list[dict], firebase_app_index: dict[str, dict]) -> dict | None:
-    if not android_streams or not firebase_app_index:
-        return None
-
-    # Best match: Firebase App ID from the GA4 Android data stream.
-    for stream in android_streams:
-        firebase_app_id = get_firebase_app_id_from_stream(stream)
-        match = firebase_app_index.get(normalise_lookup_key(firebase_app_id))
-        if match:
-            return match
-
-    # Next best match: Android package name.
-    for stream in android_streams:
-        package_name = get_android_package_name_from_stream(stream)
-        match = firebase_app_index.get(normalise_lookup_key(package_name))
-        if match:
-            return match
-
-    # Last fallback: stream display name.
-    for stream in android_streams:
-        display_name = get_stream_display_name(stream)
-        match = firebase_app_index.get(normalise_lookup_key(display_name))
-        if match:
-            return match
-
-    return None
-
-
-def build_auto_discovered_app_config(
-    property_summary: dict,
-    android_streams: list[dict],
-    firebase_app: dict | None,
-) -> AppConfig:
-    property_id = property_summary.get("property_id", "")
-    property_display_name = str(property_summary.get("property_display_name", "") or "").strip()
-
-    stream_names = [get_stream_display_name(stream) for stream in android_streams if get_stream_display_name(stream)]
-    package_names = [get_android_package_name_from_stream(stream) for stream in android_streams if get_android_package_name_from_stream(stream)]
-
-    app_name = property_display_name
-    if not app_name and stream_names:
-        app_name = stream_names[0]
-    if not app_name and package_names:
-        app_name = package_names[0]
-    if not app_name:
-        app_name = f"GA4 Property {property_id}"
-
-    firebase_app_id = ""
-    if firebase_app:
-        firebase_app_id = str(firebase_app.get("appId", "") or "").strip()
-
-    if not firebase_app_id and android_streams:
-        firebase_app_id = get_firebase_app_id_from_stream(android_streams[0])
-
-    return AppConfig(
-        app_name=app_name,
-        property_id=property_id,
-        home_screen_name=config.default_home_screen_name,
-        screen_field=config.default_screen_field,
-        firebase_project_id=str(firebase_app.get("_firebase_project_id", "") if firebase_app else "").strip(),
-        firebase_project_name=str(firebase_app.get("_firebase_project_name", "") if firebase_app else "").strip(),
-        firebase_app_id=firebase_app_id,
-        time_capping_parameter=config.time_capping_parameter,
-        daily_notification_parameters=config.daily_notification_parameters,
-        iap_screen_parameter=config.iap_screen_parameter,
-    )
-
-
-def discover_accessible_apps() -> list[AppConfig]:
-    print("Discovering GA4 properties accessible to the configured account...")
-    properties = list_accessible_ga4_properties()
-    print(f"Accessible GA4 properties found: {len(properties)}")
-
-    firebase_app_index = build_accessible_firebase_android_app_index()
-    print(f"Accessible Firebase Android app lookup keys found: {len(firebase_app_index)}")
-
-    apps = []
-    skipped_non_android = 0
-
-    for property_summary in properties:
-        property_id = property_summary.get("property_id", "")
-        property_display_name = property_summary.get("property_display_name", "") or property_id
-
-        try:
-            streams = fetch_ga4_data_streams(property_id)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(f"GA4 DATA STREAM DISCOVERY {status} for {property_display_name} / {property_id}: {error_text}")
-            continue
-
-        android_streams = [stream for stream in streams if is_android_stream(stream)]
-
-        if not android_streams:
-            skipped_non_android += 1
-            continue
-
-        firebase_app = choose_firebase_app_for_ga4_streams(android_streams, firebase_app_index)
-        app = build_auto_discovered_app_config(property_summary, android_streams, firebase_app)
-        apps.append(app)
-
-    if skipped_non_android:
-        print(f"Skipped non-Android or streamless GA4 properties: {skipped_non_android}")
-
-    if not apps:
-        raise SystemExit(
-            "No accessible Android GA4 app properties were found. "
-            "Check that the service account has access to GA4 properties and Analytics Admin API is enabled."
-        )
-
-    return apps
 
 
 def add_package_name_column(rows: list[list], package_name_lookup: dict[str, str]) -> list[list]:
@@ -2138,7 +1858,7 @@ def get_firebase_remote_config_template(firebase_project_id: str) -> tuple[dict,
     project_id = str(firebase_project_id).strip()
 
     if not project_id:
-        raise ValueError("Firebase Project ID could not be auto-resolved for this app.")
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
 
     project_path = f"projects/{project_id}"
     url = f"{config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
@@ -3911,7 +3631,7 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
     configured_app_id = str(app.firebase_app_id or "").strip()
 
     if not project_identifier:
-        raise ValueError("Firebase Project ID could not be auto-resolved for this app.")
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
 
     if not configured_app_id:
         # Try to auto-find the app when only one Android app exists in the project.
@@ -3923,11 +3643,11 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
                 selected.get("appId", ""),
                 "Firebase App ID was empty; auto-resolved from Firebase Android apps list.",
             )
-        raise ValueError("Firebase App ID could not be auto-resolved from accessible Firebase Android apps.")
+        raise ValueError("Firebase App ID is empty in Apps Config and could not be auto-resolved from Firebase Android apps.")
 
     # If the value already looks like a Firebase App ID, use it first. We still may retry using Management API on 400.
     if looks_like_firebase_app_id(configured_app_id):
-        return project_identifier, configured_app_id, "Using auto-resolved Firebase App ID."
+        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
 
     # If the user entered a package name or display name, resolve it through Firebase Management API.
     android_apps = list_firebase_android_apps(project_identifier)
@@ -3936,11 +3656,11 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
         return (
             selected.get("projectId") or project_identifier,
             selected.get("appId", ""),
-            f"Firebase App ID auto-resolved from configured value '{configured_app_id}'.",
+            f"Firebase App ID auto-resolved from Apps Config value '{configured_app_id}'.",
         )
 
     raise ValueError(
-        "Invalid Firebase App ID. It must be Android Firebase App ID like "
+        "Invalid Firebase App ID. Apps Config column H must be Android Firebase App ID like "
         "1:1234567890:android:abcdef, or a package name that can be resolved from Firebase Management API."
     )
 
@@ -4005,7 +3725,7 @@ def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
 
         raise RuntimeError(
             error_text
-            + " | Check access/config: Firebase Project ID should be the real Firebase project ID, "
+            + " | Check Apps Config: Firebase Project ID should be the real Firebase project ID, "
             "and Firebase App ID should be the Android appId from Firebase project settings, not only project number/package name."
         )
 
@@ -4107,11 +3827,11 @@ def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
 
 
 def main():
-    print("Auto-discovering accessible apps from GA4/Firebase...")
+    print("Reading app list from Apps Config sheet...")
 
-    apps = discover_accessible_apps()
+    apps = read_apps_config()
 
-    print(f"Total accessible Android apps found: {len(apps)}")
+    print(f"Total enabled apps found: {len(apps)}")
 
     package_name_lookup = {}
 
