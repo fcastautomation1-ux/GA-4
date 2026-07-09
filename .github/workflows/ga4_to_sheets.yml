@@ -1,10 +1,9 @@
 name: GA4 to Google Sheets
 
 on:
-  workflow_dispatch:
+  workflow_dispatch
 
-  schedule:
-    - cron: "0 4 * * *"
+ 
 
 jobs:
   ga4-to-sheets:
