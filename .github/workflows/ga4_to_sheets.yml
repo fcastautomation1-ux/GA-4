@@ -58,6 +58,7 @@ jobs:
           NOTIFICATION_EVENT_NAMES: ${{ vars.NOTIFICATION_EVENT_NAMES || 'notification_receive,notification_foreground,notification_open,notification_dismiss' }}
           NOTIFICATION_EVENT_LIMIT: ${{ vars.NOTIFICATION_EVENT_LIMIT || '500' }}
           FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
+          GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
           DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
