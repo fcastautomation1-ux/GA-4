@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -51,8 +52,11 @@ credentials = get_credentials()
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
 analytics_admin_session = None
 remote_config_session = None
+notification_api_session = None
 package_name_cache: dict[str, str] = {}
 remote_config_template_cache: dict[str, dict] = {}
+fcm_delivery_cache: dict[tuple[str, str], dict] = {}
+firebase_android_apps_cache: dict[str, list[dict]] = {}
 
 MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
 OLD_REPORT_SHEET_NAMES = {
@@ -1101,6 +1105,263 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
         }
 
 
+
+# =========================
+# FCM NOTIFICATION DELIVERY
+# =========================
+
+
+def get_notification_api_session():
+    global notification_api_session
+    if notification_api_session is None:
+        notification_api_session = AuthorizedSession(credentials)
+    return notification_api_session
+
+
+def format_fcm_date(date_data: dict) -> str:
+    year = int(date_data.get("year", 0) or 0)
+    month = int(date_data.get("month", 0) or 0)
+    day = int(date_data.get("day", 0) or 0)
+    if year and month and day:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return json.dumps(date_data, ensure_ascii=False)
+
+
+def get_percent(data: dict, key: str) -> str:
+    value = data.get(key, "") if data else ""
+    if value in [None, ""]:
+        return ""
+    try:
+        return f"{round(float(value), 2)}%"
+    except Exception:
+        return str(value)
+
+
+def looks_like_firebase_app_id(value: str) -> bool:
+    value = str(value or "").strip()
+    return re.match(r"^1:\d+:(android|ios|web):", value) is not None
+
+
+def list_firebase_android_apps(project_identifier: str) -> list[dict]:
+    project_identifier = str(project_identifier or "").strip()
+    if not project_identifier:
+        return []
+    if project_identifier in firebase_android_apps_cache:
+        return firebase_android_apps_cache[project_identifier]
+
+    apps = []
+    page_token = ""
+    while True:
+        parent = f"projects/{quote(project_identifier, safe='-')}"
+        url = f"{config.firebase_management_api_base}/{parent}/androidApps"
+        params = {"pageSize": 100}
+        if page_token:
+            params["pageToken"] = page_token
+        response = get_notification_api_session().get(
+            url,
+            params=params,
+            timeout=config.firebase_remote_config_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Firebase Management API error {response.status_code}: {response.text}")
+        payload = response.json()
+        apps.extend(payload.get("apps", []) or [])
+        page_token = payload.get("nextPageToken", "")
+        if not page_token:
+            break
+    firebase_android_apps_cache[project_identifier] = apps
+    return apps
+
+
+def choose_firebase_android_app(app: AppConfig, apps: list[dict]) -> dict | None:
+    if not apps:
+        return None
+    wanted = str(app.firebase_app_id or "").strip().lower()
+    app_name = str(app.app_name or "").strip().lower()
+
+    if wanted:
+        for item in apps:
+            if str(item.get("appId", "")).lower() == wanted:
+                return item
+        for item in apps:
+            if str(item.get("packageName", "")).lower() == wanted:
+                return item
+
+    if app_name:
+        for item in apps:
+            display = str(item.get("displayName", "")).strip().lower()
+            package = str(item.get("packageName", "")).strip().lower()
+            if display and (display in app_name or app_name in display):
+                return item
+            if package and (package in app_name or app_name in package):
+                return item
+
+    if len(apps) == 1:
+        return apps[0]
+    return None
+
+
+def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
+    project_identifier = str(app.firebase_project_id or "").strip()
+    configured_app_id = str(app.firebase_app_id or "").strip()
+
+    if not project_identifier:
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
+
+    if not configured_app_id:
+        android_apps = list_firebase_android_apps(project_identifier)
+        selected = choose_firebase_android_app(app, android_apps)
+        if selected:
+            return (
+                selected.get("projectId") or project_identifier,
+                selected.get("appId", ""),
+                "Firebase App ID was empty; auto-resolved from Firebase Android apps list.",
+            )
+        raise ValueError("Firebase App ID is empty in Apps Config and could not be auto-resolved from Firebase Android apps.")
+
+    if looks_like_firebase_app_id(configured_app_id):
+        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
+
+    android_apps = list_firebase_android_apps(project_identifier)
+    selected = choose_firebase_android_app(app, android_apps)
+    if selected:
+        return (
+            selected.get("projectId") or project_identifier,
+            selected.get("appId", ""),
+            f"Firebase App ID auto-resolved from Apps Config value '{configured_app_id}'.",
+        )
+
+    raise ValueError(
+        "Invalid Firebase App ID. Apps Config Firebase App ID should be Android Firebase App ID like "
+        "1:1234567890:android:abcdef, or a package name that can be resolved from Firebase Management API."
+    )
+
+
+def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool = False) -> dict:
+    project_part = quote(str(project_id).strip(), safe="-")
+    app_safe = "" if encode_colons else ":"
+    app_part = quote(str(app_id).strip(), safe=app_safe)
+    parent = f"projects/{project_part}/androidApps/{app_part}"
+    url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
+    response = get_notification_api_session().get(
+        url,
+        params={"pageSize": config.fcm_data_page_size},
+        timeout=config.firebase_remote_config_timeout,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"FCM Data API error {response.status_code}: {response.text}")
+    return response.json()
+
+
+def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
+    project_id, app_id, resolution_note = resolve_fcm_project_and_app_id(app)
+    cache_key = (project_id, app_id)
+    if cache_key in fcm_delivery_cache:
+        cached_payload = dict(fcm_delivery_cache[cache_key])
+        cached_payload["_resolution_note"] = resolution_note + " Reused cached FCM delivery response."
+        return cached_payload
+
+    try:
+        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=False)
+        payload["_resolution_note"] = resolution_note
+        payload["_resolved_project_id"] = project_id
+        payload["_resolved_app_id"] = app_id
+        fcm_delivery_cache[cache_key] = dict(payload)
+        return payload
+    except RuntimeError as error:
+        error_text = str(error)
+        if "400" in error_text or "INVALID_ARGUMENT" in error_text:
+            try:
+                payload = request_fcm_delivery_data(project_id, app_id, encode_colons=True)
+                payload["_resolution_note"] = resolution_note + " Retried with encoded Firebase App ID."
+                payload["_resolved_project_id"] = project_id
+                payload["_resolved_app_id"] = app_id
+                fcm_delivery_cache[cache_key] = dict(payload)
+                return payload
+            except RuntimeError:
+                pass
+
+        try:
+            android_apps = list_firebase_android_apps(app.firebase_project_id)
+            selected = choose_firebase_android_app(app, android_apps)
+            if selected:
+                normalized_project_id = selected.get("projectId") or project_id
+                normalized_app_id = selected.get("appId") or app_id
+                payload = request_fcm_delivery_data(normalized_project_id, normalized_app_id, encode_colons=False)
+                payload["_resolution_note"] = "Retried after resolving app through Firebase Management API."
+                payload["_resolved_project_id"] = normalized_project_id
+                payload["_resolved_app_id"] = normalized_app_id
+                fcm_delivery_cache[(normalized_project_id, normalized_app_id)] = dict(payload)
+                fcm_delivery_cache[cache_key] = dict(payload)
+                return payload
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            error_text
+            + " | Check Apps Config: Firebase Project ID should be the real Firebase project ID, "
+            "and Firebase App ID should be the Android appId from Firebase project settings."
+        )
+
+
+def fcm_delivery_to_lines(delivery: dict) -> list[str]:
+    data = delivery.get("data", {}) or {}
+    outcome = data.get("messageOutcomePercents", {}) or {}
+    performance = data.get("deliveryPerformancePercents", {}) or {}
+    insight = data.get("messageInsightPercents", {}) or {}
+    proxy = data.get("proxyNotificationInsightPercents", {}) or {}
+    label = delivery.get("analyticsLabel", "") or "(no analytics label)"
+
+    return [
+        f"Analytics Label: {label}",
+        f"Messages Accepted: {data.get('countMessagesAccepted', '')}",
+        f"Notifications Accepted: {data.get('countNotificationsAccepted', '')}",
+        f"Delivered: {get_percent(outcome, 'delivered')}",
+        f"Pending: {get_percent(outcome, 'pending')}",
+        f"Collapsed: {get_percent(outcome, 'collapsed')}",
+        f"Dropped - Too Many Pending: {get_percent(outcome, 'droppedTooManyPendingMessages')}",
+        f"Dropped - App Force Stopped: {get_percent(outcome, 'droppedAppForceStopped')}",
+        f"Dropped - Device Inactive: {get_percent(outcome, 'droppedDeviceInactive')}",
+        f"Dropped - TTL Expired: {get_percent(outcome, 'droppedTtlExpired')}",
+        f"Delivered No Delay: {get_percent(performance, 'deliveredNoDelay')}",
+        f"Delayed - Device Offline: {get_percent(performance, 'delayedDeviceOffline')}",
+        f"Delayed - Device Doze: {get_percent(performance, 'delayedDeviceDoze')}",
+        f"Delayed - Message Throttled: {get_percent(performance, 'delayedMessageThrottled')}",
+        f"Priority Lowered: {get_percent(insight, 'priorityLowered')}",
+        f"Proxied: {get_percent(proxy, 'proxied')}",
+    ]
+
+
+def build_fcm_delivery_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, str]:
+    result = {report_date: "" for report_date in report_dates}
+    try:
+        response = get_fcm_delivery_data_for_app(app)
+        delivery_rows = response.get("androidDeliveryData", []) or []
+        if not delivery_rows:
+            message = "No aggregate FCM delivery rows returned for this Firebase Android app."
+            return {report_date: message for report_date in report_dates}
+
+        grouped: dict[str, list[str]] = {report_date: [] for report_date in report_dates}
+        for delivery in delivery_rows:
+            delivery_date = format_fcm_date(delivery.get("date", {}) or {})
+            if delivery_date not in grouped:
+                continue
+            lines = fcm_delivery_to_lines(delivery)
+            grouped[delivery_date].append(lines_to_cell([line for line in lines if not line.endswith(': ')], 30))
+
+        for report_date in report_dates:
+            if grouped.get(report_date):
+                result[report_date] = lines_to_cell(grouped[report_date], 80)
+            else:
+                result[report_date] = "No FCM delivery data returned for this date."
+        return result
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
+        message = f"{status}: {error_text}"
+        return {report_date: message for report_date in report_dates}
+
+
 def build_session_retention_cell(metrics: dict, retention: dict) -> str:
     return lines_to_cell(
         [
@@ -1217,6 +1478,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     personalized_ux = {report_date: [] for report_date in report_dates}
     remote_events = {report_date: [] for report_date in report_dates}
     remote_versions = {report_date: [] for report_date in report_dates}
+    fcm_delivery = {report_date: "" for report_date in report_dates}
     static_remote = get_remote_config_static_summaries(app)
 
     try:
@@ -1259,6 +1521,11 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"REMOTE CONFIG APP VERSIONS {status} for {app.app_name}: {error_text}")
+    try:
+        fcm_delivery = build_fcm_delivery_by_date(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
 
     rows = []
     for report_date in report_dates:
@@ -1274,6 +1541,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
                     report_date,
                     notification_events,
                 ),
+                fcm_delivery.get(report_date, ""),
                 build_audience_cell(audience_segments.get(report_date, [])),
                 build_basic_funnel_cell(report_date, app, event_data, home_data, key_events),
                 build_remote_config_cell(
@@ -1301,6 +1569,7 @@ def main():
         "Package Name",
         "Date",
         "Daily Notifications",
+        "Firebase Notification Delivery",
         "Audience Segments",
         "Basic Funnel Analysis",
         "Remote Configuration",
@@ -1329,6 +1598,7 @@ def main():
     print(f"Rows written: {len(rows) - 1}")
     print(f"Approx GA4 Data API calls per app: {approx_ga4_calls_per_app}")
     print("Firebase Remote Config calls: about 1 per unique Firebase Project ID, cached and reused for Time Capping, IAP Screen, Daily Notifications, and Remote Configuration.")
+    print("FCM Data API calls: about 1 per unique Firebase Android App ID, cached and written inside GA4 Merged Data.")
     print("No separate report sheets are created or written.")
 
 
