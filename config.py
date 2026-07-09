@@ -55,6 +55,7 @@ class Config:
     daily_notifications_sheet: str
     ga4_notification_events_sheet: str
     fcm_delivery_sheet: str
+    merged_sheet: str
 
     start_date: str
     end_date: str
@@ -132,6 +133,10 @@ def load_config() -> Config:
         fcm_delivery_sheet=optional_env(
             "FCM_DELIVERY_SHEET",
             "Firebase Notification Delivery",
+        ),
+        merged_sheet=optional_env(
+            "MERGED_SHEET",
+            "GA4 Merged Data",
         ),
 
         start_date=optional_env("START_DATE", "7daysAgo"),
