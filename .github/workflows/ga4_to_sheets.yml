@@ -27,8 +27,8 @@ jobs:
           GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-          START_DATE: ${{ vars.START_DATE || '28daysAgo' }}
-          END_DATE: ${{ vars.END_DATE || 'yesterday' }}
+          START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
+          END_DATE: ${{ vars.END_DATE || 'today' }}
           RETENTION_DAYS: ${{ vars.RETENTION_DAYS || '7' }}
 
           APPS_CONFIG_SHEET: Apps Config
