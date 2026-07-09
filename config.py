@@ -134,8 +134,8 @@ def load_config() -> Config:
             "Firebase Notification Delivery",
         ),
 
-        start_date=optional_env("START_DATE", "28daysAgo"),
-        end_date=optional_env("END_DATE", "yesterday"),
+        start_date=optional_env("START_DATE", "7daysAgo"),
+        end_date=optional_env("END_DATE", "today"),
         timezone=optional_env("TIMEZONE", "Asia/Karachi"),
 
         default_home_screen_name=optional_env(
