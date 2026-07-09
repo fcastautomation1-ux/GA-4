@@ -469,88 +469,20 @@ def get_firebase_app_id_from_stream(stream: dict) -> str:
     return str(android_data.get("firebaseAppId", "")).strip()
 
 
-def get_stream_display_name(stream: dict) -> str:
-    return str(stream.get("displayName", "")).strip()
-
-
-def normalize_match_text(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-
-
-def get_package_tail(package_name: str) -> str:
-    return str(package_name or "").strip().split(".")[-1]
-
-
-def stream_matches_app_name(stream: dict, app_name: str) -> bool:
-    app_key = normalize_match_text(app_name)
-
-    if not app_key:
-        return False
-
-    package_name = get_android_package_name_from_stream(stream)
-    candidates = [
-        get_stream_display_name(stream),
-        package_name,
-        get_package_tail(package_name),
-    ]
-
-    for candidate in candidates:
-        candidate_key = normalize_match_text(candidate)
-
-        if not candidate_key:
-            continue
-
-        if candidate_key == app_key:
-            return True
-
-        if app_key in candidate_key or candidate_key in app_key:
-            return True
-
-    return False
-
-
-def fetch_ga4_package_name(
-    property_id: str,
-    firebase_app_id: str = "",
-    app_name: str = "",
-) -> str:
+def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
     property_id = str(property_id).strip()
     firebase_app_id = str(firebase_app_id).strip()
-    app_name = str(app_name).strip()
 
     if not property_id:
         return ""
 
-    cache_key = f"{property_id}|{firebase_app_id}|{app_name}"
+    cache_key = f"{property_id}|{firebase_app_id}"
 
     if cache_key in package_name_cache:
         return package_name_cache[cache_key]
 
     try:
-        url = f"{config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
-        params = {"pageSize": 200}
-        streams = []
-
-        while True:
-            response = get_analytics_admin_session().get(
-                url,
-                params=params,
-                timeout=30,
-            )
-
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"GA4 Admin API error {response.status_code}: {response.text}"
-                )
-
-            payload = response.json()
-            streams.extend(payload.get("dataStreams", []) or [])
-
-            next_page_token = payload.get("nextPageToken", "")
-            if not next_page_token:
-                break
-
-            params["pageToken"] = next_page_token
+        streams = fetch_ga4_data_streams(property_id)
 
         android_streams = [
             stream
@@ -565,41 +497,327 @@ def fetch_ga4_package_name(
                     package_name_cache[cache_key] = package_name
                     return package_name
 
-        matched_streams = [
-            stream
-            for stream in android_streams
-            if stream_matches_app_name(stream, app_name)
-        ]
+        package_names = []
+        seen = set()
 
-        if len(matched_streams) == 1:
-            package_name = get_android_package_name_from_stream(matched_streams[0])
-            package_name_cache[cache_key] = package_name
-            return package_name
+        for stream in android_streams:
+            package_name = get_android_package_name_from_stream(stream)
+            if package_name and package_name not in seen:
+                package_names.append(package_name)
+                seen.add(package_name)
 
-        if len(android_streams) == 1:
-            package_name = get_android_package_name_from_stream(android_streams[0])
-            package_name_cache[cache_key] = package_name
-            return package_name
-
-        # Important: do not join multiple package names into one cell.
-        # A GA4 property can contain multiple Android data streams, and those
-        # are separate apps/packages. Joining them here causes the combined
-        # report to merge different apps into one row.
-        if len(android_streams) > 1:
-            print(
-                "Package name ambiguous for "
-                f"{app_name or property_id}. Add Firebase App ID in Apps Config "
-                "or make the GA4 data stream display name match the App Name."
-            )
-
-        package_name_cache[cache_key] = ""
-        return ""
+        package_name = ", ".join(package_names)
+        package_name_cache[cache_key] = package_name
+        return package_name
 
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"PACKAGE NAME {status} for property {property_id}: {error_text}")
         package_name_cache[cache_key] = ""
         return ""
+
+
+# =========================
+# AUTO DISCOVER ACCESSIBLE APPS
+# =========================
+
+
+def extract_id_from_resource_name(resource_name: str) -> str:
+    value = str(resource_name or "").strip()
+    if "/" not in value:
+        return value
+    return value.rstrip("/").split("/")[-1]
+
+
+def fetch_ga4_data_streams(property_id: str) -> list[dict]:
+    property_id = str(property_id or "").strip()
+    if not property_id:
+        return []
+
+    url = f"{config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
+    params = {"pageSize": 200}
+    streams = []
+
+    while True:
+        response = get_analytics_admin_session().get(
+            url,
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"GA4 Admin API error {response.status_code}: {response.text}"
+            )
+
+        payload = response.json()
+        streams.extend(payload.get("dataStreams", []) or [])
+
+        next_page_token = payload.get("nextPageToken", "")
+        if not next_page_token:
+            break
+
+        params["pageToken"] = next_page_token
+
+    return streams
+
+
+def list_accessible_ga4_properties() -> list[dict]:
+    url = f"{config.ga4_admin_api_base}/accountSummaries"
+    params = {"pageSize": 200}
+    properties = []
+    seen = set()
+
+    while True:
+        response = get_analytics_admin_session().get(
+            url,
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"GA4 Admin API error {response.status_code}: {response.text}"
+            )
+
+        payload = response.json()
+
+        for account_summary in payload.get("accountSummaries", []) or []:
+            account_name = account_summary.get("name", "")
+            account_display_name = account_summary.get("displayName", "")
+
+            for property_summary in account_summary.get("propertySummaries", []) or []:
+                property_resource = property_summary.get("property", "")
+                property_id = extract_id_from_resource_name(property_resource)
+
+                if not property_id or property_id in seen:
+                    continue
+
+                seen.add(property_id)
+                properties.append(
+                    {
+                        "property_id": property_id,
+                        "property_resource": property_resource,
+                        "property_display_name": property_summary.get("displayName", ""),
+                        "property_type": property_summary.get("propertyType", ""),
+                        "account_name": account_name,
+                        "account_display_name": account_display_name,
+                    }
+                )
+
+        next_page_token = payload.get("nextPageToken", "")
+        if not next_page_token:
+            break
+
+        params["pageToken"] = next_page_token
+
+    return properties
+
+
+def list_accessible_firebase_projects() -> list[dict]:
+    url = f"{config.firebase_management_api_base}/projects"
+    params = {"pageSize": 100}
+    projects = []
+    seen = set()
+
+    while True:
+        response = get_notification_api_session().get(
+            url,
+            params=params,
+            timeout=config.firebase_remote_config_timeout,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Firebase Management API error {response.status_code}: {response.text}"
+            )
+
+        payload = response.json()
+        project_rows = payload.get("results", []) or payload.get("projects", []) or []
+
+        for project in project_rows:
+            project_id = project.get("projectId", "") or extract_id_from_resource_name(project.get("name", ""))
+            if not project_id or project_id in seen:
+                continue
+
+            seen.add(project_id)
+            projects.append(project)
+
+        next_page_token = payload.get("nextPageToken", "")
+        if not next_page_token:
+            break
+
+        params["pageToken"] = next_page_token
+
+    return projects
+
+
+def normalise_lookup_key(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def add_firebase_app_to_index(index: dict[str, dict], key: str, app: dict):
+    key = normalise_lookup_key(key)
+    if key and key not in index:
+        index[key] = app
+
+
+def build_accessible_firebase_android_app_index() -> dict[str, dict]:
+    index = {}
+
+    try:
+        projects = list_accessible_firebase_projects()
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FIREBASE PROJECT DISCOVERY {status}: {error_text}")
+        return index
+
+    print(f"Accessible Firebase projects found: {len(projects)}")
+
+    for project in projects:
+        project_id = project.get("projectId", "") or extract_id_from_resource_name(project.get("name", ""))
+        project_display_name = project.get("displayName", "") or project_id
+
+        if not project_id:
+            continue
+
+        try:
+            android_apps = list_firebase_android_apps(project_id)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(f"FIREBASE ANDROID APP DISCOVERY {status} for {project_id}: {error_text}")
+            continue
+
+        for android_app in android_apps:
+            enriched_app = dict(android_app)
+            enriched_app["_firebase_project_id"] = project_id
+            enriched_app["_firebase_project_name"] = project_display_name
+
+            add_firebase_app_to_index(index, enriched_app.get("appId", ""), enriched_app)
+            add_firebase_app_to_index(index, enriched_app.get("packageName", ""), enriched_app)
+            add_firebase_app_to_index(index, enriched_app.get("displayName", ""), enriched_app)
+
+    return index
+
+
+def is_android_stream(stream: dict) -> bool:
+    return bool(get_android_package_name_from_stream(stream) or get_firebase_app_id_from_stream(stream))
+
+
+def get_stream_display_name(stream: dict) -> str:
+    return str(stream.get("displayName", "") or "").strip()
+
+
+def choose_firebase_app_for_ga4_streams(android_streams: list[dict], firebase_app_index: dict[str, dict]) -> dict | None:
+    if not android_streams or not firebase_app_index:
+        return None
+
+    # Best match: Firebase App ID from the GA4 Android data stream.
+    for stream in android_streams:
+        firebase_app_id = get_firebase_app_id_from_stream(stream)
+        match = firebase_app_index.get(normalise_lookup_key(firebase_app_id))
+        if match:
+            return match
+
+    # Next best match: Android package name.
+    for stream in android_streams:
+        package_name = get_android_package_name_from_stream(stream)
+        match = firebase_app_index.get(normalise_lookup_key(package_name))
+        if match:
+            return match
+
+    # Last fallback: stream display name.
+    for stream in android_streams:
+        display_name = get_stream_display_name(stream)
+        match = firebase_app_index.get(normalise_lookup_key(display_name))
+        if match:
+            return match
+
+    return None
+
+
+def build_auto_discovered_app_config(
+    property_summary: dict,
+    android_streams: list[dict],
+    firebase_app: dict | None,
+) -> AppConfig:
+    property_id = property_summary.get("property_id", "")
+    property_display_name = str(property_summary.get("property_display_name", "") or "").strip()
+
+    stream_names = [get_stream_display_name(stream) for stream in android_streams if get_stream_display_name(stream)]
+    package_names = [get_android_package_name_from_stream(stream) for stream in android_streams if get_android_package_name_from_stream(stream)]
+
+    app_name = property_display_name
+    if not app_name and stream_names:
+        app_name = stream_names[0]
+    if not app_name and package_names:
+        app_name = package_names[0]
+    if not app_name:
+        app_name = f"GA4 Property {property_id}"
+
+    firebase_app_id = ""
+    if firebase_app:
+        firebase_app_id = str(firebase_app.get("appId", "") or "").strip()
+
+    if not firebase_app_id and android_streams:
+        firebase_app_id = get_firebase_app_id_from_stream(android_streams[0])
+
+    return AppConfig(
+        app_name=app_name,
+        property_id=property_id,
+        home_screen_name=config.default_home_screen_name,
+        screen_field=config.default_screen_field,
+        firebase_project_id=str(firebase_app.get("_firebase_project_id", "") if firebase_app else "").strip(),
+        firebase_project_name=str(firebase_app.get("_firebase_project_name", "") if firebase_app else "").strip(),
+        firebase_app_id=firebase_app_id,
+        time_capping_parameter=config.time_capping_parameter,
+        daily_notification_parameters=config.daily_notification_parameters,
+        iap_screen_parameter=config.iap_screen_parameter,
+    )
+
+
+def discover_accessible_apps() -> list[AppConfig]:
+    print("Discovering GA4 properties accessible to the configured account...")
+    properties = list_accessible_ga4_properties()
+    print(f"Accessible GA4 properties found: {len(properties)}")
+
+    firebase_app_index = build_accessible_firebase_android_app_index()
+    print(f"Accessible Firebase Android app lookup keys found: {len(firebase_app_index)}")
+
+    apps = []
+    skipped_non_android = 0
+
+    for property_summary in properties:
+        property_id = property_summary.get("property_id", "")
+        property_display_name = property_summary.get("property_display_name", "") or property_id
+
+        try:
+            streams = fetch_ga4_data_streams(property_id)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(f"GA4 DATA STREAM DISCOVERY {status} for {property_display_name} / {property_id}: {error_text}")
+            continue
+
+        android_streams = [stream for stream in streams if is_android_stream(stream)]
+
+        if not android_streams:
+            skipped_non_android += 1
+            continue
+
+        firebase_app = choose_firebase_app_for_ga4_streams(android_streams, firebase_app_index)
+        app = build_auto_discovered_app_config(property_summary, android_streams, firebase_app)
+        apps.append(app)
+
+    if skipped_non_android:
+        print(f"Skipped non-Android or streamless GA4 properties: {skipped_non_android}")
+
+    if not apps:
+        raise SystemExit(
+            "No accessible Android GA4 app properties were found. "
+            "Check that the service account has access to GA4 properties and Analytics Admin API is enabled."
+        )
+
+    return apps
 
 
 def add_package_name_column(rows: list[list], package_name_lookup: dict[str, str]) -> list[list]:
@@ -657,616 +875,6 @@ def write_report_sheet(
         add_package_name_column(rows, package_name_lookup),
     )
 
-
-# =========================
-# JOINED PACKAGE REPORT
-# =========================
-
-
-def normalize_header_name(header: str) -> str:
-    return re.sub(r"\s+", " ", str(header or "").strip()).lower()
-
-
-def should_exclude_joined_column(header: str) -> bool:
-    normalized = normalize_header_name(header)
-
-    exact_excluded_headers = {
-        "sheet name",
-        "export row id",
-        "source",
-        "status",
-        "error",
-        "recommendation",
-        "recommendation / error",
-        "updated at",
-        "firebase project id",
-        "firebase project name",
-        "firebase app id",
-        "home screen name",
-        "screen field",
-    }
-
-    if normalized in exact_excluded_headers:
-        return True
-
-    if "source" in normalized:
-        return True
-
-    if "date range" in normalized:
-        return True
-
-    if "recommendation" in normalized:
-        return True
-
-    if normalized.endswith(" error") or normalized.endswith("/ error"):
-        return True
-
-    return False
-
-
-def get_row_value(row: list, index: int) -> str:
-    if index >= len(row):
-        return ""
-
-    return str(row[index]).strip()
-
-
-def compact_unique_values(values: list[str]) -> str:
-    compacted = []
-    seen = set()
-
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-
-        if text in seen:
-            continue
-
-        compacted.append(text)
-        seen.add(text)
-
-    if not compacted:
-        return ""
-
-    if len(compacted) == 1:
-        return compacted[0]
-
-    return " | ".join(compacted)
-
-
-def split_package_name_cell(package_name: str) -> list[str]:
-    text = str(package_name or "").strip()
-
-    if not text:
-        return []
-
-    # Handle old/ambiguous output safely if a previous run had multiple
-    # packages in one cell. Package names do not contain comma or pipe.
-    parts = [part.strip() for part in re.split(r"\s*(?:,|\|)\s*", text)]
-    parts = [part for part in parts if part]
-
-    output = []
-    seen = set()
-
-    for part in parts:
-        if part in seen:
-            continue
-
-        output.append(part)
-        seen.add(part)
-
-    return output
-
-
-def merge_values_from_package_maps(
-    package_order: list[str],
-    package_maps: list[dict[str, str]],
-) -> dict[str, str]:
-    merged = {}
-
-    for package_name in package_order:
-        merged[package_name] = compact_unique_values([
-            package_map.get(package_name, "")
-            for package_map in package_maps
-        ])
-
-    return merged
-
-
-def should_force_merge_joined_column(header: str) -> bool:
-    return normalize_header_name(header) in {"app name", "property id"}
-
-
-def get_context_column_candidates(sheet_name: str) -> list[str]:
-    normalized_sheet = normalize_header_name(friendly_joined_sheet_label(sheet_name))
-
-    if "audience segment" in normalized_sheet:
-        return ["Audience Segment"]
-
-    if "personalized user experience" in normalized_sheet:
-        return ["Personalization Breakdown", "Dimension Value"]
-
-    if "remote configuration" in normalized_sheet:
-        return ["Remote Config Area", "Rule / Type", "Value"]
-
-    if "ab time capping" in normalized_sheet or "ab iap screen" in normalized_sheet:
-        return ["Remote Config Parameter", "Condition / Variant", "Remote Config Value"]
-
-    if "daily notification" in normalized_sheet:
-        return ["Notification No", "Condition / Audience", "Notification Title"]
-
-    if "notification event" in normalized_sheet:
-        return ["Notification Event", "GA4 Date Hour Minute"]
-
-    if "notification delivery" in normalized_sheet:
-        return ["FCM Date", "Analytics Label"]
-
-    return []
-
-
-def get_context_for_joined_value(
-    sheet_name: str,
-    header: list[str],
-    row: list,
-    column_header: str,
-) -> tuple[str, str]:
-    # When one metric column has multiple rows for the same package, the joined
-    # report uses a pipe-separated value. This context tells the user which row
-    # label each piped value belongs to, for example:
-    # Audience Segment: All Users | US Users | Paid Traffic / Active Users.
-    column_indexes = {normalize_header_name(name): index for index, name in enumerate(header)}
-    context_parts = []
-    context_header_parts = []
-
-    for candidate in get_context_column_candidates(sheet_name):
-        if normalize_header_name(candidate) == normalize_header_name(column_header):
-            continue
-
-        index = column_indexes.get(normalize_header_name(candidate))
-        if index is None:
-            continue
-
-        value = get_row_value(row, index)
-        if not value:
-            continue
-
-        context_parts.append(value)
-        context_header_parts.append(candidate)
-
-    if not context_parts:
-        return "", ""
-
-    return " / ".join(context_header_parts), " / ".join(context_parts)
-
-
-def compact_joined_entries(entries: list[tuple[str, str]]) -> tuple[str, list[str]]:
-    has_context = any(context for _, context in entries)
-
-    if not has_context:
-        values = [value for value, _ in entries]
-        return compact_unique_values(values), []
-
-    values = []
-    contexts = []
-    seen_pairs = set()
-
-    for value, context in entries:
-        value = str(value or "").strip()
-        context = str(context or "").strip()
-
-        if not value:
-            continue
-
-        pair = (context, value)
-        if pair in seen_pairs:
-            continue
-
-        seen_pairs.add(pair)
-        values.append(value)
-
-        if context:
-            contexts.append(context)
-
-    return " | ".join(values), contexts
-
-
-def compact_context_values(values: list[str], max_values: int = 12) -> str:
-    compacted = []
-    seen = set()
-
-    for value in values:
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-
-        compacted.append(text)
-        seen.add(text)
-
-        if len(compacted) >= max_values:
-            break
-
-    return " | ".join(compacted)
-
-
-def make_context_aware_header(
-    sheet_name: str,
-    column_header: str,
-    context_header_names: list[str],
-    context_values: list[str],
-) -> str:
-    sheet_label = friendly_joined_sheet_label(sheet_name)
-    context_header = compact_unique_values(context_header_names)
-    context_display = compact_context_values(context_values)
-
-    if context_header and context_display:
-        return f"{sheet_label} - {context_header}: {context_display} / {column_header}"
-
-    if context_header:
-        return f"{sheet_label} - {context_header} / {column_header}"
-
-    return f"{sheet_label} - {column_header}"
-
-
-def package_maps_are_same_for_apps(
-    package_order: list[str],
-    package_maps: list[dict[str, str]],
-) -> bool:
-    for package_name in package_order:
-        values = {
-            str(package_map.get(package_name, "")).strip()
-            for package_map in package_maps
-            if str(package_map.get(package_name, "")).strip()
-        }
-
-        if len(values) > 1:
-            return False
-
-    return True
-
-
-def merge_package_maps(
-    package_order: list[str],
-    package_maps: list[dict[str, str]],
-) -> dict[str, str]:
-    merged = {}
-
-    for package_name in package_order:
-        for package_map in package_maps:
-            value = str(package_map.get(package_name, "")).strip()
-            if value:
-                merged[package_name] = value
-                break
-
-        merged.setdefault(package_name, "")
-
-    return merged
-
-
-def friendly_joined_sheet_label(sheet_name: str) -> str:
-    label = str(sheet_name or "").strip()
-    label = re.sub(r"^(GA4|Firebase)\s+", "", label, flags=re.IGNORECASE).strip()
-    return label or "Report"
-
-
-def make_unique_headers(headers: list[str]) -> list[str]:
-    output = []
-    counts = {}
-
-    for header in headers:
-        base = str(header or "Column").strip() or "Column"
-        count = counts.get(base, 0) + 1
-        counts[base] = count
-
-        if count == 1:
-            output.append(base)
-        else:
-            output.append(f"{base} {count}")
-
-    return output
-
-
-def get_package_from_lookup(
-    app_name: str,
-    property_id: str,
-    package_name_lookup: dict[str, str],
-) -> str:
-    app_name = str(app_name or "").strip()
-    property_id = str(property_id or "").strip()
-
-    return str(
-        package_name_lookup.get(
-            f"{app_name}|{property_id}",
-            package_name_lookup.get(property_id, ""),
-        )
-        or ""
-    ).strip()
-
-
-def make_joined_app_key(
-    app_name: str,
-    property_id: str,
-    package_name: str,
-    firebase_app_id: str = "",
-) -> str:
-    """Create an internal row key that cannot merge two different apps.
-
-    The visible joined report still displays Package Name, App Name, and Property ID
-    once. Internally, we include the configured app identity too, because GA4
-    properties can contain more than one Android stream. Using only Package Name
-    or only Property ID can incorrectly merge apps such as background-eraser and
-    erasify when one stream lookup is ambiguous or blank.
-    """
-    app_key = normalize_match_text(app_name)
-    property_key = str(property_id or "").strip()
-    package_key = str(package_name or "").strip().lower()
-    firebase_key = str(firebase_app_id or "").strip().lower()
-
-    return "|".join([
-        f"app={app_key}",
-        f"property={property_key}",
-        f"package={package_key}",
-        f"firebase={firebase_key}",
-    ])
-
-
-def get_column_index(header: list[str], column_name: str) -> int | None:
-    wanted = normalize_header_name(column_name)
-
-    for index, name in enumerate(header):
-        if normalize_header_name(name) == wanted:
-            return index
-
-    return None
-
-
-def build_joined_package_report_rows(
-    report_tables: list[tuple[str, list[list]]],
-    package_name_lookup: dict[str, str],
-    apps: list[AppConfig] | None = None,
-) -> list[list]:
-    row_order = []
-    row_seen = set()
-    row_package_name: dict[str, str] = {}
-    row_app_name: dict[str, str] = {}
-    row_property_id: dict[str, str] = {}
-    field_entries: dict[tuple[str, str], dict[str, list[tuple[str, str]]]] = {}
-    field_context_headers: dict[tuple[str, str], list[str]] = {}
-    field_context_values: dict[tuple[str, str], list[str]] = {}
-    field_order: list[tuple[str, str]] = []
-    base_header_order: list[str] = []
-    base_header_seen = set()
-
-    def register_row(
-        app_name: str,
-        property_id: str,
-        package_name: str = "",
-        firebase_app_id: str = "",
-    ) -> str:
-        app_name = str(app_name or "").strip()
-        property_id = str(property_id or "").strip()
-        package_name = str(package_name or "").strip()
-        firebase_app_id = str(firebase_app_id or "").strip()
-
-        if not package_name:
-            package_name = get_package_from_lookup(app_name, property_id, package_name_lookup)
-
-        row_key = make_joined_app_key(app_name, property_id, package_name, firebase_app_id)
-
-        if row_key not in row_seen:
-            row_seen.add(row_key)
-            row_order.append(row_key)
-
-        if package_name and not row_package_name.get(row_key):
-            row_package_name[row_key] = package_name
-        else:
-            row_package_name.setdefault(row_key, package_name)
-
-        if app_name and not row_app_name.get(row_key):
-            row_app_name[row_key] = app_name
-        else:
-            row_app_name.setdefault(row_key, app_name)
-
-        if property_id and not row_property_id.get(row_key):
-            row_property_id[row_key] = property_id
-        else:
-            row_property_id.setdefault(row_key, property_id)
-
-        return row_key
-
-    # Start from Apps Config so the joined report keeps every enabled app, even
-    # when one report tab has no rows or GA4 Admin cannot resolve the package.
-    for app in apps or []:
-        register_row(
-            app_name=app.app_name,
-            property_id=app.property_id,
-            package_name=get_package_from_lookup(
-                app.app_name,
-                app.property_id,
-                package_name_lookup,
-            ),
-            firebase_app_id=app.firebase_app_id,
-        )
-
-    for sheet_name, raw_rows in report_tables:
-        rows = add_package_name_column(raw_rows, package_name_lookup)
-
-        if not rows:
-            continue
-
-        header = [str(item or "").strip() for item in rows[0]]
-
-        package_col = get_column_index(header, "Package Name")
-        app_name_col = get_column_index(header, "App Name")
-        property_id_col = get_column_index(header, "Property ID")
-        firebase_app_id_col = get_column_index(header, "Firebase App ID")
-
-        if app_name_col is None or property_id_col is None:
-            continue
-
-        for column_index, column_header in enumerate(header):
-            column_header = str(column_header or "").strip()
-
-            if not column_header:
-                continue
-
-            # App Name, Property ID, and Package Name are shown once at the
-            # beginning of the joined report. Do not collect them from every
-            # source sheet, otherwise multi-row tabs can create repeated pipe
-            # values like 504100281 | 504100281 | 504100281.
-            if normalize_header_name(column_header) in {
-                "package name",
-                "app name",
-                "property id",
-            }:
-                continue
-
-            if should_exclude_joined_column(column_header):
-                continue
-
-            key = (sheet_name, column_header)
-
-            if key not in field_entries:
-                field_entries[key] = {}
-                field_context_headers[key] = []
-                field_context_values[key] = []
-                field_order.append(key)
-
-            if column_header not in base_header_seen:
-                base_header_seen.add(column_header)
-                base_header_order.append(column_header)
-
-        for row in rows[1:]:
-            app_name = get_row_value(row, app_name_col)
-            property_id = get_row_value(row, property_id_col)
-            package_name = get_row_value(row, package_col) if package_col is not None else ""
-            firebase_app_id = (
-                get_row_value(row, firebase_app_id_col)
-                if firebase_app_id_col is not None
-                else ""
-            )
-
-            if not app_name and not property_id and not package_name:
-                continue
-
-            row_key = register_row(
-                app_name=app_name,
-                property_id=property_id,
-                package_name=package_name,
-                firebase_app_id=firebase_app_id,
-            )
-
-            for column_index, column_header in enumerate(header):
-                column_header = str(column_header or "").strip()
-
-                if not column_header:
-                    continue
-
-                if normalize_header_name(column_header) in {
-                    "package name",
-                    "app name",
-                    "property id",
-                }:
-                    continue
-
-                if should_exclude_joined_column(column_header):
-                    continue
-
-                value = get_row_value(row, column_index)
-
-                if not value:
-                    continue
-
-                context_header, context_value = get_context_for_joined_value(
-                    sheet_name=sheet_name,
-                    header=header,
-                    row=row,
-                    column_header=column_header,
-                )
-
-                key = (sheet_name, column_header)
-                field_entries.setdefault(key, {}).setdefault(row_key, []).append(
-                    (value, context_value)
-                )
-
-                if context_header and context_header not in field_context_headers.setdefault(key, []):
-                    field_context_headers[key].append(context_header)
-
-                if context_value:
-                    field_context_values.setdefault(key, []).append(context_value)
-
-    if not row_order:
-        return [["Package Name", "App Name", "Property ID"]]
-
-    compact_field_values: dict[tuple[str, str], dict[str, str]] = {}
-
-    for key, row_entries in field_entries.items():
-        compact_field_values[key] = {}
-
-        for row_key, entries in row_entries.items():
-            compact_value, row_contexts = compact_joined_entries(entries)
-            compact_field_values[key][row_key] = compact_value
-
-            if row_contexts:
-                field_context_values.setdefault(key, []).extend(row_contexts)
-
-    output_specs = []
-
-    for base_header in base_header_order:
-        matching_keys = [
-            key
-            for key in field_order
-            if key[1] == base_header and key in compact_field_values
-        ]
-
-        package_maps = [compact_field_values[key] for key in matching_keys]
-
-        if not package_maps:
-            continue
-
-        # If the same column from multiple source sheets has the same value for
-        # the same app, show it only once. If values differ, keep sheet-specific
-        # columns so the difference is visible.
-        if package_maps_are_same_for_apps(row_order, package_maps):
-            merged_map = merge_package_maps(row_order, package_maps)
-            if any(merged_map.values()):
-                output_specs.append((base_header, merged_map))
-            continue
-
-        for key in matching_keys:
-            sheet_name, column_header = key
-            package_map = compact_field_values.get(key, {})
-
-            if not any(package_map.values()):
-                continue
-
-            output_header = make_context_aware_header(
-                sheet_name=sheet_name,
-                column_header=column_header,
-                context_header_names=field_context_headers.get(key, []),
-                context_values=field_context_values.get(key, []),
-            )
-            output_specs.append((output_header, package_map))
-
-    headers = make_unique_headers(
-        ["Package Name", "App Name", "Property ID"]
-        + [header for header, _ in output_specs]
-    )
-    output_rows = [headers]
-
-    for row_key in row_order:
-        row = [
-            row_package_name.get(row_key, ""),
-            row_app_name.get(row_key, ""),
-            row_property_id.get(row_key, ""),
-        ]
-
-        for _, package_map in output_specs:
-            row.append(package_map.get(row_key, ""))
-
-        output_rows.append(row)
-
-    return output_rows
 
 # =========================
 # FUNNEL REPORT
@@ -2530,7 +2138,7 @@ def get_firebase_remote_config_template(firebase_project_id: str) -> tuple[dict,
     project_id = str(firebase_project_id).strip()
 
     if not project_id:
-        raise ValueError("Firebase Project ID is empty in Apps Config.")
+        raise ValueError("Firebase Project ID could not be auto-resolved for this app.")
 
     project_path = f"projects/{project_id}"
     url = f"{config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
@@ -4303,7 +3911,7 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
     configured_app_id = str(app.firebase_app_id or "").strip()
 
     if not project_identifier:
-        raise ValueError("Firebase Project ID is empty in Apps Config.")
+        raise ValueError("Firebase Project ID could not be auto-resolved for this app.")
 
     if not configured_app_id:
         # Try to auto-find the app when only one Android app exists in the project.
@@ -4315,11 +3923,11 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
                 selected.get("appId", ""),
                 "Firebase App ID was empty; auto-resolved from Firebase Android apps list.",
             )
-        raise ValueError("Firebase App ID is empty in Apps Config and could not be auto-resolved from Firebase Android apps.")
+        raise ValueError("Firebase App ID could not be auto-resolved from accessible Firebase Android apps.")
 
     # If the value already looks like a Firebase App ID, use it first. We still may retry using Management API on 400.
     if looks_like_firebase_app_id(configured_app_id):
-        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
+        return project_identifier, configured_app_id, "Using auto-resolved Firebase App ID."
 
     # If the user entered a package name or display name, resolve it through Firebase Management API.
     android_apps = list_firebase_android_apps(project_identifier)
@@ -4328,11 +3936,11 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
         return (
             selected.get("projectId") or project_identifier,
             selected.get("appId", ""),
-            f"Firebase App ID auto-resolved from Apps Config value '{configured_app_id}'.",
+            f"Firebase App ID auto-resolved from configured value '{configured_app_id}'.",
         )
 
     raise ValueError(
-        "Invalid Firebase App ID. Apps Config column H must be Android Firebase App ID like "
+        "Invalid Firebase App ID. It must be Android Firebase App ID like "
         "1:1234567890:android:abcdef, or a package name that can be resolved from Firebase Management API."
     )
 
@@ -4397,7 +4005,7 @@ def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
 
         raise RuntimeError(
             error_text
-            + " | Check Apps Config: Firebase Project ID should be the real Firebase project ID, "
+            + " | Check access/config: Firebase Project ID should be the real Firebase project ID, "
             "and Firebase App ID should be the Android appId from Firebase project settings, not only project number/package name."
         )
 
@@ -4499,18 +4107,13 @@ def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
 
 
 def main():
-    print("Reading app list from Apps Config sheet...")
+    print("Auto-discovering accessible apps from GA4/Firebase...")
 
-    apps = read_apps_config()
+    apps = discover_accessible_apps()
 
-    print(f"Total enabled apps found: {len(apps)}")
+    print(f"Total accessible Android apps found: {len(apps)}")
 
     package_name_lookup = {}
-    property_id_counts = {}
-
-    for app in apps:
-        property_id_key = str(app.property_id).strip()
-        property_id_counts[property_id_key] = property_id_counts.get(property_id_key, 0) + 1
 
     for app in apps:
         app_name_key = str(app.app_name).strip()
@@ -4518,18 +4121,10 @@ def main():
         package_name = fetch_ga4_package_name(
             app.property_id,
             app.firebase_app_id,
-            app.app_name,
         )
         package_name_lookup[f"{app_name_key}|{property_id_key}"] = package_name
 
-        # Use the property-level fallback only when that property maps to a
-        # single configured app. This prevents apps sharing one GA4 property
-        # from being incorrectly merged under one package name.
-        if (
-            property_id_key
-            and property_id_counts.get(property_id_key, 0) == 1
-            and package_name
-        ):
+        if property_id_key and property_id_key not in package_name_lookup:
             package_name_lookup[property_id_key] = package_name
 
         if package_name:
@@ -5191,39 +4786,18 @@ def main():
                 )
             )
 
-    report_tables = [
-        (config.summary_sheet, funnel_summary_rows),
-        (config.details_sheet, funnel_details_rows),
-        (config.user_session_sheet, user_session_rows),
-        (config.retention_details_sheet, retention_details_rows),
-        (config.audience_segments_sheet, audience_segment_rows),
-        (config.personalized_ux_sheet, personalized_ux_rows),
-        (config.remote_config_sheet, remote_config_rows),
-        (config.time_capping_ab_sheet, time_capping_ab_rows),
-        (config.iap_screen_ab_sheet, iap_screen_ab_rows),
-        (config.daily_notifications_sheet, daily_notifications_rows),
-        (config.ga4_notification_events_sheet, ga4_notification_event_rows),
-        (config.fcm_delivery_sheet, fcm_delivery_rows),
-    ]
-
-    for sheet_name, rows in report_tables:
-        write_report_sheet(sheet_name, rows, package_name_lookup)
-
-    joined_report_tables = [
-        (sheet_name, rows)
-        for sheet_name, rows in report_tables
-        if sheet_name not in {
-            config.details_sheet,
-            config.retention_details_sheet,
-        }
-    ]
-
-    joined_package_rows = build_joined_package_report_rows(
-        joined_report_tables,
-        package_name_lookup,
-        apps,
-    )
-    write_sheet(config.combined_joined_sheet, joined_package_rows)
+    write_report_sheet(config.summary_sheet, funnel_summary_rows, package_name_lookup)
+    write_report_sheet(config.details_sheet, funnel_details_rows, package_name_lookup)
+    write_report_sheet(config.user_session_sheet, user_session_rows, package_name_lookup)
+    write_report_sheet(config.retention_details_sheet, retention_details_rows, package_name_lookup)
+    write_report_sheet(config.audience_segments_sheet, audience_segment_rows, package_name_lookup)
+    write_report_sheet(config.personalized_ux_sheet, personalized_ux_rows, package_name_lookup)
+    write_report_sheet(config.remote_config_sheet, remote_config_rows, package_name_lookup)
+    write_report_sheet(config.time_capping_ab_sheet, time_capping_ab_rows, package_name_lookup)
+    write_report_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows, package_name_lookup)
+    write_report_sheet(config.daily_notifications_sheet, daily_notifications_rows, package_name_lookup)
+    write_report_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows, package_name_lookup)
+    write_report_sheet(config.fcm_delivery_sheet, fcm_delivery_rows, package_name_lookup)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -5238,7 +4812,6 @@ def main():
     print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
     print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
     print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
-    print(f"Joined Package Report: {config.combined_joined_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
