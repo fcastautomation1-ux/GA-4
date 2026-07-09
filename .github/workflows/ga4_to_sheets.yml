@@ -3,7 +3,7 @@ name: GA4 to Google Sheets
 on:
   workflow_dispatch
 
- 
+
 
 jobs:
   ga4-to-sheets:
@@ -51,6 +51,9 @@ jobs:
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
           FIREBASE_REMOTE_CONFIG_API_BASE: ${{ vars.FIREBASE_REMOTE_CONFIG_API_BASE || 'https://firebaseremoteconfig.googleapis.com/v1' }}
           FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
+          FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
+          FIREBASE_MANAGEMENT_API_BASE: ${{ vars.FIREBASE_MANAGEMENT_API_BASE || 'https://firebase.googleapis.com/v1beta1' }}
+          FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
 
           FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
           CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
