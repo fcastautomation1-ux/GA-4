@@ -597,6 +597,280 @@ def write_report_sheet(
 
 
 # =========================
+# JOINED PACKAGE REPORT
+# =========================
+
+
+def normalize_header_name(header: str) -> str:
+    return re.sub(r"\s+", " ", str(header or "").strip()).lower()
+
+
+def should_exclude_joined_column(header: str) -> bool:
+    normalized = normalize_header_name(header)
+
+    exact_excluded_headers = {
+        "sheet name",
+        "export row id",
+        "source",
+        "status",
+        "error",
+        "recommendation",
+        "recommendation / error",
+        "updated at",
+        "firebase project id",
+        "firebase project name",
+        "firebase app id",
+    }
+
+    if normalized in exact_excluded_headers:
+        return True
+
+    if "source" in normalized:
+        return True
+
+    if "date range" in normalized:
+        return True
+
+    if "recommendation" in normalized:
+        return True
+
+    if normalized.endswith(" error") or normalized.endswith("/ error"):
+        return True
+
+    return False
+
+
+def get_row_value(row: list, index: int) -> str:
+    if index >= len(row):
+        return ""
+
+    return str(row[index]).strip()
+
+
+def compact_unique_values(values: list[str]) -> str:
+    compacted = []
+    seen = set()
+
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+
+        if text in seen:
+            continue
+
+        compacted.append(text)
+        seen.add(text)
+
+    if not compacted:
+        return ""
+
+    if len(compacted) == 1:
+        return compacted[0]
+
+    return " | ".join(compacted)
+
+
+def package_maps_are_same_for_apps(
+    package_order: list[str],
+    package_maps: list[dict[str, str]],
+) -> bool:
+    for package_name in package_order:
+        values = {
+            str(package_map.get(package_name, "")).strip()
+            for package_map in package_maps
+            if str(package_map.get(package_name, "")).strip()
+        }
+
+        if len(values) > 1:
+            return False
+
+    return True
+
+
+def merge_package_maps(
+    package_order: list[str],
+    package_maps: list[dict[str, str]],
+) -> dict[str, str]:
+    merged = {}
+
+    for package_name in package_order:
+        for package_map in package_maps:
+            value = str(package_map.get(package_name, "")).strip()
+            if value:
+                merged[package_name] = value
+                break
+
+        merged.setdefault(package_name, "")
+
+    return merged
+
+
+def friendly_joined_sheet_label(sheet_name: str) -> str:
+    label = str(sheet_name or "").strip()
+    label = re.sub(r"^(GA4|Firebase)\s+", "", label, flags=re.IGNORECASE).strip()
+    return label or "Report"
+
+
+def make_unique_headers(headers: list[str]) -> list[str]:
+    output = []
+    counts = {}
+
+    for header in headers:
+        base = str(header or "Column").strip() or "Column"
+        count = counts.get(base, 0) + 1
+        counts[base] = count
+
+        if count == 1:
+            output.append(base)
+        else:
+            output.append(f"{base} {count}")
+
+    return output
+
+
+def build_joined_package_report_rows(
+    report_tables: list[tuple[str, list[list]]],
+    package_name_lookup: dict[str, str],
+) -> list[list]:
+    package_order = []
+    package_seen = set()
+    field_values: dict[tuple[str, str], dict[str, list[str]]] = {}
+    field_order: list[tuple[str, str]] = []
+    base_header_order: list[str] = []
+    base_header_seen = set()
+
+    for sheet_name, raw_rows in report_tables:
+        rows = add_package_name_column(raw_rows, package_name_lookup)
+
+        if not rows:
+            continue
+
+        header = [str(item or "").strip() for item in rows[0]]
+
+        if "Package Name" not in header:
+            continue
+
+        package_col = header.index("Package Name")
+
+        for column_index, column_header in enumerate(header):
+            column_header = str(column_header or "").strip()
+
+            if not column_header:
+                continue
+
+            if column_header == "Package Name":
+                continue
+
+            if should_exclude_joined_column(column_header):
+                continue
+
+            key = (sheet_name, column_header)
+
+            if key not in field_values:
+                field_values[key] = {}
+                field_order.append(key)
+
+            if column_header not in base_header_seen:
+                base_header_seen.add(column_header)
+                base_header_order.append(column_header)
+
+        for row in rows[1:]:
+            package_name = get_row_value(row, package_col)
+
+            if not package_name:
+                continue
+
+            if package_name not in package_seen:
+                package_seen.add(package_name)
+                package_order.append(package_name)
+
+            for column_index, column_header in enumerate(header):
+                column_header = str(column_header or "").strip()
+
+                if not column_header or column_header == "Package Name":
+                    continue
+
+                if should_exclude_joined_column(column_header):
+                    continue
+
+                value = get_row_value(row, column_index)
+
+                if not value:
+                    continue
+
+                key = (sheet_name, column_header)
+                field_values.setdefault(key, {}).setdefault(package_name, []).append(value)
+
+    if not package_order:
+        return [["Package Name"]]
+
+    compact_field_values: dict[tuple[str, str], dict[str, str]] = {}
+
+    for key, package_values in field_values.items():
+        compact_field_values[key] = {
+            package_name: compact_unique_values(values)
+            for package_name, values in package_values.items()
+        }
+
+    output_specs = []
+
+    for base_header in base_header_order:
+        matching_keys = [
+            key
+            for key in field_order
+            if key[1] == base_header and key in compact_field_values
+        ]
+
+        package_maps = [compact_field_values[key] for key in matching_keys]
+
+        if not package_maps:
+            continue
+
+        if package_maps_are_same_for_apps(package_order, package_maps):
+            merged_map = merge_package_maps(package_order, package_maps)
+            if any(merged_map.values()):
+                output_specs.append((base_header, merged_map))
+            continue
+
+        for key in matching_keys:
+            sheet_name, column_header = key
+            package_map = compact_field_values.get(key, {})
+
+            if not any(package_map.values()):
+                continue
+
+            output_header = f"{friendly_joined_sheet_label(sheet_name)} - {column_header}"
+            output_specs.append((output_header, package_map))
+
+    priority_headers = ["App Name", "Property ID"]
+    prioritized_specs = []
+    remaining_specs = []
+
+    for output_header, package_map in output_specs:
+        if output_header in priority_headers:
+            prioritized_specs.append((output_header, package_map))
+        else:
+            remaining_specs.append((output_header, package_map))
+
+    prioritized_specs.sort(key=lambda spec: priority_headers.index(spec[0]))
+    output_specs = prioritized_specs + remaining_specs
+
+    headers = make_unique_headers(["Package Name"] + [header for header, _ in output_specs])
+    output_rows = [headers]
+
+    for package_name in package_order:
+        row = [package_name]
+
+        for _, package_map in output_specs:
+            row.append(package_map.get(package_name, ""))
+
+        output_rows.append(row)
+
+    return output_rows
+
+
+# =========================
 # FUNNEL REPORT
 # =========================
 
@@ -4506,18 +4780,29 @@ def main():
                 )
             )
 
-    write_report_sheet(config.summary_sheet, funnel_summary_rows, package_name_lookup)
-    write_report_sheet(config.details_sheet, funnel_details_rows, package_name_lookup)
-    write_report_sheet(config.user_session_sheet, user_session_rows, package_name_lookup)
-    write_report_sheet(config.retention_details_sheet, retention_details_rows, package_name_lookup)
-    write_report_sheet(config.audience_segments_sheet, audience_segment_rows, package_name_lookup)
-    write_report_sheet(config.personalized_ux_sheet, personalized_ux_rows, package_name_lookup)
-    write_report_sheet(config.remote_config_sheet, remote_config_rows, package_name_lookup)
-    write_report_sheet(config.time_capping_ab_sheet, time_capping_ab_rows, package_name_lookup)
-    write_report_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows, package_name_lookup)
-    write_report_sheet(config.daily_notifications_sheet, daily_notifications_rows, package_name_lookup)
-    write_report_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows, package_name_lookup)
-    write_report_sheet(config.fcm_delivery_sheet, fcm_delivery_rows, package_name_lookup)
+    report_tables = [
+        (config.summary_sheet, funnel_summary_rows),
+        (config.details_sheet, funnel_details_rows),
+        (config.user_session_sheet, user_session_rows),
+        (config.retention_details_sheet, retention_details_rows),
+        (config.audience_segments_sheet, audience_segment_rows),
+        (config.personalized_ux_sheet, personalized_ux_rows),
+        (config.remote_config_sheet, remote_config_rows),
+        (config.time_capping_ab_sheet, time_capping_ab_rows),
+        (config.iap_screen_ab_sheet, iap_screen_ab_rows),
+        (config.daily_notifications_sheet, daily_notifications_rows),
+        (config.ga4_notification_events_sheet, ga4_notification_event_rows),
+        (config.fcm_delivery_sheet, fcm_delivery_rows),
+    ]
+
+    for sheet_name, rows in report_tables:
+        write_report_sheet(sheet_name, rows, package_name_lookup)
+
+    joined_package_rows = build_joined_package_report_rows(
+        report_tables,
+        package_name_lookup,
+    )
+    write_sheet(config.combined_joined_sheet, joined_package_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -4532,6 +4817,7 @@ def main():
     print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
     print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
     print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
+    print(f"Joined Package Report: {config.combined_joined_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
