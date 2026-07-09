@@ -72,6 +72,8 @@ credentials = get_credentials()
 alpha_client = AlphaAnalyticsDataClient(credentials=credentials)
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
 remote_config_session = None
+analytics_admin_session = None
+package_name_cache = {}
 
 
 def get_sheets_service():
@@ -441,6 +443,157 @@ def classify_api_error(error) -> tuple[str, str]:
         return "INVALID PROPERTY ID", error_text
 
     return "ERROR", error_text
+
+
+# =========================
+# GA4 APP PACKAGE NAME
+# =========================
+
+
+def get_analytics_admin_session():
+    global analytics_admin_session
+
+    if analytics_admin_session is None:
+        analytics_admin_session = AuthorizedSession(credentials)
+
+    return analytics_admin_session
+
+
+def get_android_package_name_from_stream(stream: dict) -> str:
+    android_data = stream.get("androidAppStreamData", {}) or {}
+    return str(android_data.get("packageName", "")).strip()
+
+
+def get_firebase_app_id_from_stream(stream: dict) -> str:
+    android_data = stream.get("androidAppStreamData", {}) or {}
+    return str(android_data.get("firebaseAppId", "")).strip()
+
+
+def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
+    property_id = str(property_id).strip()
+    firebase_app_id = str(firebase_app_id).strip()
+
+    if not property_id:
+        return ""
+
+    cache_key = f"{property_id}|{firebase_app_id}"
+
+    if cache_key in package_name_cache:
+        return package_name_cache[cache_key]
+
+    try:
+        url = f"{config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
+        params = {"pageSize": 200}
+        streams = []
+
+        while True:
+            response = get_analytics_admin_session().get(
+                url,
+                params=params,
+                timeout=30,
+            )
+
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"GA4 Admin API error {response.status_code}: {response.text}"
+                )
+
+            payload = response.json()
+            streams.extend(payload.get("dataStreams", []) or [])
+
+            next_page_token = payload.get("nextPageToken", "")
+            if not next_page_token:
+                break
+
+            params["pageToken"] = next_page_token
+
+        android_streams = [
+            stream
+            for stream in streams
+            if get_android_package_name_from_stream(stream)
+        ]
+
+        if firebase_app_id:
+            for stream in android_streams:
+                if get_firebase_app_id_from_stream(stream) == firebase_app_id:
+                    package_name = get_android_package_name_from_stream(stream)
+                    package_name_cache[cache_key] = package_name
+                    return package_name
+
+        package_names = []
+        seen = set()
+
+        for stream in android_streams:
+            package_name = get_android_package_name_from_stream(stream)
+            if package_name and package_name not in seen:
+                package_names.append(package_name)
+                seen.add(package_name)
+
+        package_name = ", ".join(package_names)
+        package_name_cache[cache_key] = package_name
+        return package_name
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"PACKAGE NAME {status} for property {property_id}: {error_text}")
+        package_name_cache[cache_key] = ""
+        return ""
+
+
+def add_package_name_column(rows: list[list], package_name_lookup: dict[str, str]) -> list[list]:
+    if not rows:
+        return rows
+
+    header = list(rows[0])
+
+    if "Package Name" in header:
+        return rows
+
+    if "App Name" not in header or "Property ID" not in header:
+        return rows
+
+    app_name_col = header.index("App Name")
+    property_id_col = header.index("Property ID")
+    insert_col = app_name_col + 1
+
+    updated_rows = []
+    header.insert(insert_col, "Package Name")
+    updated_rows.append(header)
+
+    for row in rows[1:]:
+        updated_row = list(row)
+        app_name = ""
+        property_id = ""
+
+        if len(updated_row) > app_name_col:
+            app_name = str(updated_row[app_name_col]).strip()
+
+        if len(updated_row) > property_id_col:
+            property_id = str(updated_row[property_id_col]).strip()
+
+        package_name = package_name_lookup.get(
+            f"{app_name}|{property_id}",
+            package_name_lookup.get(property_id, ""),
+        )
+
+        while len(updated_row) < insert_col:
+            updated_row.append("")
+
+        updated_row.insert(insert_col, package_name)
+        updated_rows.append(updated_row)
+
+    return updated_rows
+
+
+def write_report_sheet(
+    sheet_name: str,
+    rows: list[list],
+    package_name_lookup: dict[str, str],
+):
+    write_sheet(
+        sheet_name,
+        add_package_name_column(rows, package_name_lookup),
+    )
 
 
 # =========================
@@ -3680,6 +3833,25 @@ def main():
 
     print(f"Total enabled apps found: {len(apps)}")
 
+    package_name_lookup = {}
+
+    for app in apps:
+        app_name_key = str(app.app_name).strip()
+        property_id_key = str(app.property_id).strip()
+        package_name = fetch_ga4_package_name(
+            app.property_id,
+            app.firebase_app_id,
+        )
+        package_name_lookup[f"{app_name_key}|{property_id_key}"] = package_name
+
+        if property_id_key and property_id_key not in package_name_lookup:
+            package_name_lookup[property_id_key] = package_name
+
+        if package_name:
+            print(f"Package name found for {app.app_name}: {package_name}")
+        else:
+            print(f"Package name not found for {app.app_name} / {app.property_id}.")
+
     funnel_summary_rows = [
         [
             "App Name",
@@ -4334,18 +4506,18 @@ def main():
                 )
             )
 
-    write_sheet(config.summary_sheet, funnel_summary_rows)
-    write_sheet(config.details_sheet, funnel_details_rows)
-    write_sheet(config.user_session_sheet, user_session_rows)
-    write_sheet(config.retention_details_sheet, retention_details_rows)
-    write_sheet(config.audience_segments_sheet, audience_segment_rows)
-    write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
-    write_sheet(config.remote_config_sheet, remote_config_rows)
-    write_sheet(config.time_capping_ab_sheet, time_capping_ab_rows)
-    write_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows)
-    write_sheet(config.daily_notifications_sheet, daily_notifications_rows)
-    write_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows)
-    write_sheet(config.fcm_delivery_sheet, fcm_delivery_rows)
+    write_report_sheet(config.summary_sheet, funnel_summary_rows, package_name_lookup)
+    write_report_sheet(config.details_sheet, funnel_details_rows, package_name_lookup)
+    write_report_sheet(config.user_session_sheet, user_session_rows, package_name_lookup)
+    write_report_sheet(config.retention_details_sheet, retention_details_rows, package_name_lookup)
+    write_report_sheet(config.audience_segments_sheet, audience_segment_rows, package_name_lookup)
+    write_report_sheet(config.personalized_ux_sheet, personalized_ux_rows, package_name_lookup)
+    write_report_sheet(config.remote_config_sheet, remote_config_rows, package_name_lookup)
+    write_report_sheet(config.time_capping_ab_sheet, time_capping_ab_rows, package_name_lookup)
+    write_report_sheet(config.iap_screen_ab_sheet, iap_screen_ab_rows, package_name_lookup)
+    write_report_sheet(config.daily_notifications_sheet, daily_notifications_rows, package_name_lookup)
+    write_report_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows, package_name_lookup)
+    write_report_sheet(config.fcm_delivery_sheet, fcm_delivery_rows, package_name_lookup)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
