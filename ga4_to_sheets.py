@@ -966,18 +966,127 @@ def make_unique_headers(headers: list[str]) -> list[str]:
     return output
 
 
+def get_package_from_lookup(
+    app_name: str,
+    property_id: str,
+    package_name_lookup: dict[str, str],
+) -> str:
+    app_name = str(app_name or "").strip()
+    property_id = str(property_id or "").strip()
+
+    return str(
+        package_name_lookup.get(
+            f"{app_name}|{property_id}",
+            package_name_lookup.get(property_id, ""),
+        )
+        or ""
+    ).strip()
+
+
+def make_joined_app_key(
+    app_name: str,
+    property_id: str,
+    package_name: str,
+    firebase_app_id: str = "",
+) -> str:
+    """Create an internal row key that cannot merge two different apps.
+
+    The visible joined report still displays Package Name, App Name, and Property ID
+    once. Internally, we include the configured app identity too, because GA4
+    properties can contain more than one Android stream. Using only Package Name
+    or only Property ID can incorrectly merge apps such as background-eraser and
+    erasify when one stream lookup is ambiguous or blank.
+    """
+    app_key = normalize_match_text(app_name)
+    property_key = str(property_id or "").strip()
+    package_key = str(package_name or "").strip().lower()
+    firebase_key = str(firebase_app_id or "").strip().lower()
+
+    return "|".join([
+        f"app={app_key}",
+        f"property={property_key}",
+        f"package={package_key}",
+        f"firebase={firebase_key}",
+    ])
+
+
+def get_column_index(header: list[str], column_name: str) -> int | None:
+    wanted = normalize_header_name(column_name)
+
+    for index, name in enumerate(header):
+        if normalize_header_name(name) == wanted:
+            return index
+
+    return None
+
+
 def build_joined_package_report_rows(
     report_tables: list[tuple[str, list[list]]],
     package_name_lookup: dict[str, str],
+    apps: list[AppConfig] | None = None,
 ) -> list[list]:
-    package_order = []
-    package_seen = set()
+    row_order = []
+    row_seen = set()
+    row_package_name: dict[str, str] = {}
+    row_app_name: dict[str, str] = {}
+    row_property_id: dict[str, str] = {}
     field_entries: dict[tuple[str, str], dict[str, list[tuple[str, str]]]] = {}
     field_context_headers: dict[tuple[str, str], list[str]] = {}
     field_context_values: dict[tuple[str, str], list[str]] = {}
     field_order: list[tuple[str, str]] = []
     base_header_order: list[str] = []
     base_header_seen = set()
+
+    def register_row(
+        app_name: str,
+        property_id: str,
+        package_name: str = "",
+        firebase_app_id: str = "",
+    ) -> str:
+        app_name = str(app_name or "").strip()
+        property_id = str(property_id or "").strip()
+        package_name = str(package_name or "").strip()
+        firebase_app_id = str(firebase_app_id or "").strip()
+
+        if not package_name:
+            package_name = get_package_from_lookup(app_name, property_id, package_name_lookup)
+
+        row_key = make_joined_app_key(app_name, property_id, package_name, firebase_app_id)
+
+        if row_key not in row_seen:
+            row_seen.add(row_key)
+            row_order.append(row_key)
+
+        if package_name and not row_package_name.get(row_key):
+            row_package_name[row_key] = package_name
+        else:
+            row_package_name.setdefault(row_key, package_name)
+
+        if app_name and not row_app_name.get(row_key):
+            row_app_name[row_key] = app_name
+        else:
+            row_app_name.setdefault(row_key, app_name)
+
+        if property_id and not row_property_id.get(row_key):
+            row_property_id[row_key] = property_id
+        else:
+            row_property_id.setdefault(row_key, property_id)
+
+        return row_key
+
+    # Start from Apps Config so the joined report keeps every enabled app, even
+    # when one report tab has no rows or GA4 Admin cannot resolve the package.
+    for app in apps or []:
+        register_row(
+            app_name=app.app_name,
+            property_id=app.property_id,
+            package_name=get_package_from_lookup(
+                app.app_name,
+                app.property_id,
+                package_name_lookup,
+            ),
+            firebase_app_id=app.firebase_app_id,
+        )
 
     for sheet_name, raw_rows in report_tables:
         rows = add_package_name_column(raw_rows, package_name_lookup)
@@ -987,10 +1096,13 @@ def build_joined_package_report_rows(
 
         header = [str(item or "").strip() for item in rows[0]]
 
-        if "Package Name" not in header:
-            continue
+        package_col = get_column_index(header, "Package Name")
+        app_name_col = get_column_index(header, "App Name")
+        property_id_col = get_column_index(header, "Property ID")
+        firebase_app_id_col = get_column_index(header, "Firebase App ID")
 
-        package_col = header.index("Package Name")
+        if app_name_col is None or property_id_col is None:
+            continue
 
         for column_index, column_header in enumerate(header):
             column_header = str(column_header or "").strip()
@@ -998,7 +1110,15 @@ def build_joined_package_report_rows(
             if not column_header:
                 continue
 
-            if column_header == "Package Name":
+            # App Name, Property ID, and Package Name are shown once at the
+            # beginning of the joined report. Do not collect them from every
+            # source sheet, otherwise multi-row tabs can create repeated pipe
+            # values like 504100281 | 504100281 | 504100281.
+            if normalize_header_name(column_header) in {
+                "package name",
+                "app name",
+                "property id",
+            }:
                 continue
 
             if should_exclude_joined_column(column_header):
@@ -1017,62 +1137,78 @@ def build_joined_package_report_rows(
                 base_header_order.append(column_header)
 
         for row in rows[1:]:
-            package_names = split_package_name_cell(get_row_value(row, package_col))
+            app_name = get_row_value(row, app_name_col)
+            property_id = get_row_value(row, property_id_col)
+            package_name = get_row_value(row, package_col) if package_col is not None else ""
+            firebase_app_id = (
+                get_row_value(row, firebase_app_id_col)
+                if firebase_app_id_col is not None
+                else ""
+            )
 
-            if not package_names:
+            if not app_name and not property_id and not package_name:
                 continue
 
-            for package_name in package_names:
-                if package_name not in package_seen:
-                    package_seen.add(package_name)
-                    package_order.append(package_name)
+            row_key = register_row(
+                app_name=app_name,
+                property_id=property_id,
+                package_name=package_name,
+                firebase_app_id=firebase_app_id,
+            )
 
-                for column_index, column_header in enumerate(header):
-                    column_header = str(column_header or "").strip()
+            for column_index, column_header in enumerate(header):
+                column_header = str(column_header or "").strip()
 
-                    if not column_header or column_header == "Package Name":
-                        continue
+                if not column_header:
+                    continue
 
-                    if should_exclude_joined_column(column_header):
-                        continue
+                if normalize_header_name(column_header) in {
+                    "package name",
+                    "app name",
+                    "property id",
+                }:
+                    continue
 
-                    value = get_row_value(row, column_index)
+                if should_exclude_joined_column(column_header):
+                    continue
 
-                    if not value:
-                        continue
+                value = get_row_value(row, column_index)
 
-                    context_header, context_value = get_context_for_joined_value(
-                        sheet_name=sheet_name,
-                        header=header,
-                        row=row,
-                        column_header=column_header,
-                    )
+                if not value:
+                    continue
 
-                    key = (sheet_name, column_header)
-                    field_entries.setdefault(key, {}).setdefault(package_name, []).append(
-                        (value, context_value)
-                    )
+                context_header, context_value = get_context_for_joined_value(
+                    sheet_name=sheet_name,
+                    header=header,
+                    row=row,
+                    column_header=column_header,
+                )
 
-                    if context_header and context_header not in field_context_headers.setdefault(key, []):
-                        field_context_headers[key].append(context_header)
+                key = (sheet_name, column_header)
+                field_entries.setdefault(key, {}).setdefault(row_key, []).append(
+                    (value, context_value)
+                )
 
-                    if context_value:
-                        field_context_values.setdefault(key, []).append(context_value)
+                if context_header and context_header not in field_context_headers.setdefault(key, []):
+                    field_context_headers[key].append(context_header)
 
-    if not package_order:
-        return [["Package Name"]]
+                if context_value:
+                    field_context_values.setdefault(key, []).append(context_value)
+
+    if not row_order:
+        return [["Package Name", "App Name", "Property ID"]]
 
     compact_field_values: dict[tuple[str, str], dict[str, str]] = {}
 
-    for key, package_entries in field_entries.items():
+    for key, row_entries in field_entries.items():
         compact_field_values[key] = {}
 
-        for package_name, entries in package_entries.items():
-            compact_value, package_contexts = compact_joined_entries(entries)
-            compact_field_values[key][package_name] = compact_value
+        for row_key, entries in row_entries.items():
+            compact_value, row_contexts = compact_joined_entries(entries)
+            compact_field_values[key][row_key] = compact_value
 
-            if package_contexts:
-                field_context_values.setdefault(key, []).extend(package_contexts)
+            if row_contexts:
+                field_context_values.setdefault(key, []).extend(row_contexts)
 
     output_specs = []
 
@@ -1088,14 +1224,11 @@ def build_joined_package_report_rows(
         if not package_maps:
             continue
 
-        if should_force_merge_joined_column(base_header):
-            merged_map = merge_values_from_package_maps(package_order, package_maps)
-            if any(merged_map.values()):
-                output_specs.append((base_header, merged_map))
-            continue
-
-        if package_maps_are_same_for_apps(package_order, package_maps):
-            merged_map = merge_package_maps(package_order, package_maps)
+        # If the same column from multiple source sheets has the same value for
+        # the same app, show it only once. If values differ, keep sheet-specific
+        # columns so the difference is visible.
+        if package_maps_are_same_for_apps(row_order, package_maps):
+            merged_map = merge_package_maps(row_order, package_maps)
             if any(merged_map.values()):
                 output_specs.append((base_header, merged_map))
             continue
@@ -1115,27 +1248,21 @@ def build_joined_package_report_rows(
             )
             output_specs.append((output_header, package_map))
 
-    priority_headers = ["App Name", "Property ID"]
-    prioritized_specs = []
-    remaining_specs = []
-
-    for output_header, package_map in output_specs:
-        if output_header in priority_headers:
-            prioritized_specs.append((output_header, package_map))
-        else:
-            remaining_specs.append((output_header, package_map))
-
-    prioritized_specs.sort(key=lambda spec: priority_headers.index(spec[0]))
-    output_specs = prioritized_specs + remaining_specs
-
-    headers = make_unique_headers(["Package Name"] + [header for header, _ in output_specs])
+    headers = make_unique_headers(
+        ["Package Name", "App Name", "Property ID"]
+        + [header for header, _ in output_specs]
+    )
     output_rows = [headers]
 
-    for package_name in package_order:
-        row = [package_name]
+    for row_key in row_order:
+        row = [
+            row_package_name.get(row_key, ""),
+            row_app_name.get(row_key, ""),
+            row_property_id.get(row_key, ""),
+        ]
 
         for _, package_map in output_specs:
-            row.append(package_map.get(package_name, ""))
+            row.append(package_map.get(row_key, ""))
 
         output_rows.append(row)
 
@@ -5094,6 +5221,7 @@ def main():
     joined_package_rows = build_joined_package_report_rows(
         joined_report_tables,
         package_name_lookup,
+        apps,
     )
     write_sheet(config.combined_joined_sheet, joined_package_rows)
 
