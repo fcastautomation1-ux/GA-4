@@ -59,6 +59,9 @@ class Config:
 
     notification_event_names: str
     key_event_names: str
+    app_open_event_names: str
+    home_event_names: str
+    feature_event_names: str
     notification_parameter_keywords: str
     personalized_top_n: int
     remote_config_event_limit: int
@@ -102,6 +105,15 @@ def load_config() -> Config:
         key_event_names=optional_env(
             "KEY_EVENT_NAMES",
             "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start",
+        ),
+        app_open_event_names=optional_env(
+            "APP_OPEN_EVENT_NAMES",
+            "session_start,app_open,first_open",
+        ),
+        home_event_names=optional_env("HOME_EVENT_NAMES", ""),
+        feature_event_names=optional_env(
+            "FEATURE_EVENT_NAMES",
+            optional_env("KEY_EVENT_NAMES", "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start"),
         ),
         notification_parameter_keywords=optional_env(
             "NOTIFICATION_PARAMETER_KEYWORDS",
