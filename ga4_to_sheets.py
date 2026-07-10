@@ -798,7 +798,7 @@ def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str
         for row in page_rows:
             report_date = ga4_date_to_iso(row.get("date", ""))
             value = row.get(dimension_name, "") or "(not set)"
-            if report_date in by_date and len(by_date[report_date]) < max(config.personalized_top_n, 5):
+            if report_date in by_date and len(by_date[report_date]) < max(config.personalized_top_n, 1):
                 by_date[report_date].append(
                     {
                         "label": label,
@@ -829,7 +829,7 @@ def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, di
         try:
             by_date = run_dimension_session_report(app, label, dimension_name, report_dates)
             for report_date in report_dates:
-                result[report_date][label] = by_date.get(report_date, [])[: max(config.personalized_top_n, 5)]
+                result[report_date][label] = by_date.get(report_date, [])[: max(config.personalized_top_n, 1)]
         except Exception as error:
             status, error_text = classify_api_error(error)
             print(f"PERSONALIZED UX {label} {status} for {app.app_name}: {error_text}")
@@ -900,7 +900,8 @@ def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> d
         response = beta_client.run_report(request)
         for row in parse_response_rows(response):
             report_date = ga4_date_to_iso(row.get("date", ""))
-            if report_date in result and len(result[report_date]) < max(config.remote_config_app_version_limit, 10):
+            version_limit = config.remote_config_app_version_limit
+            if report_date in result and (version_limit <= 0 or len(result[report_date]) < version_limit):
                 result[report_date].append(
                     {
                         "version": row.get("appVersion", "") or "(not set)",
@@ -1530,19 +1531,30 @@ REMOTE_EVENT_COLUMNS = [
 ]
 
 PERSONALIZED_COLUMN_SPECS = [
-    ("Country", "country", "country"),
-    ("Language", "language", "language"),
-    ("Device Category", "device_category", "device_category"),
-    ("Operating System", "operating_system", "operating_system"),
-    ("App Version", "app_version", "app_version"),
-    ("First User Medium", "first_user_medium", "first_user_medium"),
-    ("Top Screens / Screen Class", "screen", "screen_class"),
+    ("Country", "country"),
+    ("Language", "language"),
+    ("Device Category", "device_category"),
+    ("Operating System", "operating_system"),
+    ("App Version", "app_version"),
+    ("First User Medium", "first_user_medium"),
+    ("Top Screens / Screen Class", "screen_class"),
 ]
 
 
 def build_output_headers() -> list[str]:
     headers = ["Package Name", "Date"]
-    headers.extend(NOTIFICATION_COLUMNS)
+
+    # GA4 notification events are split into numeric Events and Users columns.
+    for event_name in NOTIFICATION_COLUMNS:
+        headers.extend(
+            [
+                f"{event_name}_Events",
+                f"{event_name}_USERS",
+            ]
+        )
+
+    # Firebase delivery, audience, funnel, A/B, time analysis, and retention
+    # columns retain their previously approved names.
     headers.extend(FCM_COLUMNS)
 
     for _, slug in AUDIENCE_SEGMENTS:
@@ -1580,18 +1592,13 @@ def build_output_headers() -> list[str]:
             ]
         )
 
-    for rank in range(1, 11):
-        headers.extend(
-            [
-                f"remote_app_version_{rank}/version",
-                f"remote_app_version_{rank}/users",
-                f"remote_app_version_{rank}/sessions",
-                f"remote_app_version_{rank}/er",
-            ]
-        )
-
+    # App-version values are row keys, not rank-specific columns.
     headers.extend(
         [
+            "remote_app_version",
+            "remote_app_version_users",
+            "remote_app_version_sessions",
+            "remote_app_version_er",
             "A/B Test on Time Capping",
             "A/B Test on IAPs Screen",
             "time_analysis_active_users",
@@ -1607,20 +1614,16 @@ def build_output_headers() -> list[str]:
             "retention_d1_first_session_retention",
             "retention_d7_first_session_active_users",
             "retention_d7_first_session_retention",
+            # Personalized values are stored as actual row keys. This avoids
+            # fixed columns such as screen_MainActivity or version_1.0.20.
+            "personalized_category",
+            "personalized_key",
+            "personalized_users",
+            "personalized_sessions",
+            "personalized_er",
+            "personalized_avg",
         ]
     )
-
-    for _, slug, value_name in PERSONALIZED_COLUMN_SPECS:
-        for rank in range(1, 6):
-            headers.extend(
-                [
-                    f"personalized_{slug}_{rank}/{value_name}",
-                    f"personalized_{slug}_{rank}/users",
-                    f"personalized_{slug}_{rank}/sessions",
-                    f"personalized_{slug}_{rank}/er",
-                    f"personalized_{slug}_{rank}/avg",
-                ]
-            )
 
     if len(headers) != len(set(headers)):
         duplicates = sorted({name for name in headers if headers.count(name) > 1})
@@ -1699,8 +1702,12 @@ def set_remote_columns(
     row: dict,
     remote_static: str,
     remote_events: dict[str, dict],
-    remote_versions: list[dict],
 ):
+    """Set Remote Config template and GA4 event fields.
+
+    App-version performance is intentionally handled in separate keyed rows so
+    the same version never moves between rank-based columns across dates.
+    """
     row.update(parse_remote_static_fields(remote_static))
 
     for event_name in REMOTE_EVENT_COLUMNS:
@@ -1708,12 +1715,12 @@ def set_remote_columns(
         row[f"remote_{event_name}/users"] = data.get("users", 0)
         row[f"remote_{event_name}/events"] = data.get("events", 0)
 
-    for rank in range(1, 11):
-        item = remote_versions[rank - 1] if rank <= len(remote_versions) else {}
-        row[f"remote_app_version_{rank}/version"] = item.get("version", "")
-        row[f"remote_app_version_{rank}/users"] = item.get("users", "")
-        row[f"remote_app_version_{rank}/sessions"] = item.get("sessions", "")
-        row[f"remote_app_version_{rank}/er"] = item.get("er", "")
+
+def set_remote_version_columns(row: dict, item: dict):
+    row["remote_app_version"] = item.get("version", "")
+    row["remote_app_version_users"] = item.get("users", "")
+    row["remote_app_version_sessions"] = item.get("sessions", "")
+    row["remote_app_version_er"] = item.get("er", "")
 
 
 def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
@@ -1733,16 +1740,19 @@ def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
     row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available yet")
 
 
-def set_personalized_columns(row: dict, personalized_data: dict[str, list[dict]]):
-    for label, slug, value_name in PERSONALIZED_COLUMN_SPECS:
-        items = personalized_data.get(label, [])
-        for rank in range(1, 6):
-            item = items[rank - 1] if rank <= len(items) else {}
-            row[f"personalized_{slug}_{rank}/{value_name}"] = item.get("value", "")
-            row[f"personalized_{slug}_{rank}/users"] = item.get("active", "")
-            row[f"personalized_{slug}_{rank}/sessions"] = item.get("sessions", "")
-            row[f"personalized_{slug}_{rank}/er"] = item.get("engagement", "")
-            row[f"personalized_{slug}_{rank}/avg"] = item.get("avg", "")
+def set_personalized_columns(row: dict, category: str, item: dict):
+    """Set one actual Personalized UX key on one row.
+
+    Examples of keys are Ukraine, English, mobile, Android, 1.0.20, cpc,
+    MainActivity, or any other value returned by GA4. No value is hardcoded into
+    a column name.
+    """
+    row["personalized_category"] = category
+    row["personalized_key"] = item.get("value", "")
+    row["personalized_users"] = item.get("active", "")
+    row["personalized_sessions"] = item.get("sessions", "")
+    row["personalized_er"] = item.get("engagement", "")
+    row["personalized_avg"] = item.get("avg", "")
 
 
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
@@ -1823,36 +1833,57 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
     rows: list[list] = []
     for report_date in report_dates:
-        row = {header: "" for header in OUTPUT_HEADERS}
-        row["Package Name"] = package_name
-        row["Date"] = report_date
+        # One summary row stores all package-date metrics that have exactly one
+        # value for the date. Dynamic app-version and Personalized UX records
+        # are written as additional keyed rows below it, without duplicating
+        # summary metrics and causing accidental double-counting.
+        summary_row = {header: "" for header in OUTPUT_HEADERS}
+        summary_row["Package Name"] = package_name
+        summary_row["Date"] = report_date
 
         for event_name in NOTIFICATION_COLUMNS:
             data = get_event_metric(event_data, report_date, event_name)
-            row[event_name] = (
-                f"Events: {to_number(data.get('event_count', 0))} | "
-                f"Users: {to_number(data.get('active_users', 0))}"
-            )
+            summary_row[f"{event_name}_Events"] = to_number(data.get("event_count", 0))
+            summary_row[f"{event_name}_USERS"] = to_number(data.get("active_users", 0))
 
-        row.update(fcm_delivery.get(report_date, {}))
-        set_audience_columns(row, audience_segments.get(report_date, []))
-        set_funnel_columns(row, report_date, app, event_data, home_data)
+        summary_row.update(fcm_delivery.get(report_date, {}))
+        set_audience_columns(summary_row, audience_segments.get(report_date, []))
+        set_funnel_columns(summary_row, report_date, app, event_data, home_data)
         set_remote_columns(
-            row,
+            summary_row,
             static_remote.get("remote_config_static", ""),
             remote_events.get(report_date, {}),
-            remote_versions.get(report_date, []),
         )
-        row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
-        row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
+        summary_row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
+        summary_row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
         set_time_and_retention_columns(
-            row,
+            summary_row,
             daily_metrics.get(report_date, {}),
             retention_data.get(report_date, {}),
         )
-        set_personalized_columns(row, personalized_ux.get(report_date, {}))
+        rows.append([summary_row.get(header, "") for header in OUTPUT_HEADERS])
 
-        rows.append([row.get(header, "") for header in OUTPUT_HEADERS])
+        # Remote app-version records use the actual version as the row key.
+        # Only versions returned for this package/date create rows.
+        for version_item in remote_versions.get(report_date, []):
+            version_row = {header: "" for header in OUTPUT_HEADERS}
+            version_row["Package Name"] = package_name
+            version_row["Date"] = report_date
+            set_remote_version_columns(version_row, version_item)
+            rows.append([version_row.get(header, "") for header in OUTPUT_HEADERS])
+
+        # Personalized records use category + actual GA4 value as the key.
+        # A dimension with two values creates two rows; it never creates five
+        # empty rank columns. This works for every app without hardcoding
+        # countries, languages, versions, media, systems, or screen classes.
+        personalized_for_date = personalized_ux.get(report_date, {})
+        for category, _ in PERSONALIZED_COLUMN_SPECS:
+            for item in personalized_for_date.get(category, []):
+                personalized_row = {header: "" for header in OUTPUT_HEADERS}
+                personalized_row["Package Name"] = package_name
+                personalized_row["Date"] = report_date
+                set_personalized_columns(personalized_row, category, item)
+                rows.append([personalized_row.get(header, "") for header in OUTPUT_HEADERS])
     return rows
 
 
@@ -1874,5 +1905,7 @@ def main():
         rows.extend(build_rows_for_app(app, report_dates, package_name))
 
     write_sheet(config.merged_sheet, rows)
+
+
 if __name__ == "__main__":
     main()
