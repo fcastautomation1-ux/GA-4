@@ -1833,57 +1833,61 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
     rows: list[list] = []
     for report_date in report_dates:
-        # One summary row stores all package-date metrics that have exactly one
-        # value for the date. Dynamic app-version and Personalized UX records
-        # are written as additional keyed rows below it, without duplicating
-        # summary metrics and causing accidental double-counting.
-        summary_row = {header: "" for header in OUTPUT_HEADERS}
-        summary_row["Package Name"] = package_name
-        summary_row["Date"] = report_date
-
-        for event_name in NOTIFICATION_COLUMNS:
-            data = get_event_metric(event_data, report_date, event_name)
-            summary_row[f"{event_name}_Events"] = to_number(data.get("event_count", 0))
-            summary_row[f"{event_name}_USERS"] = to_number(data.get("active_users", 0))
-
-        summary_row.update(fcm_delivery.get(report_date, {}))
-        set_audience_columns(summary_row, audience_segments.get(report_date, []))
-        set_funnel_columns(summary_row, report_date, app, event_data, home_data)
-        set_remote_columns(
-            summary_row,
-            static_remote.get("remote_config_static", ""),
-            remote_events.get(report_date, {}),
-        )
-        summary_row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
-        summary_row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
-        set_time_and_retention_columns(
-            summary_row,
-            daily_metrics.get(report_date, {}),
-            retention_data.get(report_date, {}),
-        )
-        rows.append([summary_row.get(header, "") for header in OUTPUT_HEADERS])
-
-        # Remote app-version records use the actual version as the row key.
-        # Only versions returned for this package/date create rows.
-        for version_item in remote_versions.get(report_date, []):
-            version_row = {header: "" for header in OUTPUT_HEADERS}
-            version_row["Package Name"] = package_name
-            version_row["Date"] = report_date
-            set_remote_version_columns(version_row, version_item)
-            rows.append([version_row.get(header, "") for header in OUTPUT_HEADERS])
-
-        # Personalized records use category + actual GA4 value as the key.
-        # A dimension with two values creates two rows; it never creates five
-        # empty rank columns. This works for every app without hardcoding
-        # countries, languages, versions, media, systems, or screen classes.
+        # Remote app versions and Personalized UX are independent datasets.
+        # They are compacted side by side by row position so one dataset does
+        # not create an empty vertical block before the other. The first row
+        # also carries the package-date summary fields, removing the previous
+        # blank gap under the dynamic columns.
+        personalized_items: list[tuple[str, dict]] = []
         personalized_for_date = personalized_ux.get(report_date, {})
         for category, _ in PERSONALIZED_COLUMN_SPECS:
             for item in personalized_for_date.get(category, []):
-                personalized_row = {header: "" for header in OUTPUT_HEADERS}
-                personalized_row["Package Name"] = package_name
-                personalized_row["Date"] = report_date
-                set_personalized_columns(personalized_row, category, item)
-                rows.append([personalized_row.get(header, "") for header in OUTPUT_HEADERS])
+                personalized_items.append((category, item))
+
+        version_items = remote_versions.get(report_date, [])
+        row_count = max(1, len(version_items), len(personalized_items))
+
+        for index in range(row_count):
+            output_row = {header: "" for header in OUTPUT_HEADERS}
+            output_row["Package Name"] = package_name
+            output_row["Date"] = report_date
+
+            # Store date-level summary metrics only once, on the first compact
+            # row for this package and date.
+            if index == 0:
+                for event_name in NOTIFICATION_COLUMNS:
+                    data = get_event_metric(event_data, report_date, event_name)
+                    output_row[f"{event_name}_Events"] = to_number(data.get("event_count", 0))
+                    output_row[f"{event_name}_USERS"] = to_number(data.get("active_users", 0))
+
+                output_row.update(fcm_delivery.get(report_date, {}))
+                set_audience_columns(output_row, audience_segments.get(report_date, []))
+                set_funnel_columns(output_row, report_date, app, event_data, home_data)
+                set_remote_columns(
+                    output_row,
+                    static_remote.get("remote_config_static", ""),
+                    remote_events.get(report_date, {}),
+                )
+                output_row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
+                output_row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
+                set_time_and_retention_columns(
+                    output_row,
+                    daily_metrics.get(report_date, {}),
+                    retention_data.get(report_date, {}),
+                )
+
+            # Fill the next Remote Config app-version record, when available.
+            if index < len(version_items):
+                set_remote_version_columns(output_row, version_items[index])
+
+            # Fill the next Personalized UX record independently, when
+            # available. It can share the row with a remote-version record;
+            # there is no analytical relationship implied between them.
+            if index < len(personalized_items):
+                category, item = personalized_items[index]
+                set_personalized_columns(output_row, category, item)
+
+            rows.append([output_row.get(header, "") for header in OUTPUT_HEADERS])
     return rows
 
 
