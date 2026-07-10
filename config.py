@@ -121,7 +121,7 @@ def load_config() -> Config:
         ),
         personalized_top_n=optional_int_env("PERSONALIZED_TOP_N", 5),
         remote_config_event_limit=optional_int_env("REMOTE_CONFIG_EVENT_LIMIT", 25),
-        remote_config_app_version_limit=optional_int_env("REMOTE_CONFIG_APP_VERSION_LIMIT", 10),
+        remote_config_app_version_limit=optional_int_env("REMOTE_CONFIG_APP_VERSION_LIMIT", 0),
 
         time_capping_parameter=optional_env("TIME_CAPPING_PARAMETER", "ad_time_capping"),
         iap_screen_parameter=optional_env("IAP_SCREEN_PARAMETER", "iap_screen"),
