@@ -1456,11 +1456,12 @@ def build_session_retention_cell(metrics: dict, retention: dict) -> str:
             f"Avg Session Duration: {metrics.get('Avg Session Duration', '0m 0s')}",
             f"Sessions Per Active User: {metrics.get('Sessions Per Active User', 0)}",
             f"Total Engagement Time: {metrics.get('Total Engagement Time', '0m 0s')}",
-            f"Cohort Total Users: {retention.get('Cohort Total Users', 0)}",
-            f"D1 Active Users: {retention.get('D1 Active Users', 0)}",
-            f"D1 Retention: {retention.get('D1 Retention', '0%')}",
-            f"D7 Active Users: {retention.get('D7 Active Users', 0)}",
-            f"D7 Retention: {retention.get('D7 Retention', '0%')}",
+            "Cohort Basis: First Session Date",
+            f"First-Session Cohort Total Users: {retention.get('Cohort Total Users', 0)}",
+            f"D1 First-Session Active Users: {retention.get('D1 Active Users', 0)}",
+            f"D1 First-Session Retention: {retention.get('D1 Retention', '0%')}",
+            f"D7 First-Session Active Users: {retention.get('D7 Active Users', 0)}",
+            f"D7 First-Session Retention: {retention.get('D7 Retention', '0%')}",
         ]
     )
 
@@ -1677,7 +1678,7 @@ def main():
         "Remote Configuration",
         "A/B Test on Time Capping",
         "A/B Test on IAPs Screen",
-        "Retention and Session Time Analysis",
+        "First-Session Retention and Session Time Analysis",
         "Personalized User Experience",
     ]
     rows = [header]
