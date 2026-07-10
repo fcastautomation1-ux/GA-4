@@ -798,7 +798,7 @@ def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str
         for row in page_rows:
             report_date = ga4_date_to_iso(row.get("date", ""))
             value = row.get(dimension_name, "") or "(not set)"
-            if report_date in by_date and len(by_date[report_date]) < config.personalized_top_n:
+            if report_date in by_date and len(by_date[report_date]) < max(config.personalized_top_n, 5):
                 by_date[report_date].append(
                     {
                         "label": label,
@@ -822,23 +822,19 @@ def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str
     return by_date
 
 
-def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
-    result = {report_date: [] for report_date in report_dates}
+def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, dict[str, list[dict]]]:
+    """Return structured top values for each personalized dimension and date."""
+    result = {report_date: {} for report_date in report_dates}
     for label, dimension_name in get_personalized_ux_dimensions():
         try:
             by_date = run_dimension_session_report(app, label, dimension_name, report_dates)
-            for report_date, items in by_date.items():
-                if items:
-                    item_text = "; ".join(
-                        f"{item['value']} (Users {item['active']}, Sessions {item['sessions']}, ER {item['engagement']}, Avg {item['avg']})"
-                        for item in items[: config.personalized_top_n]
-                    )
-                    result[report_date].append(f"{label}: {item_text}")
+            for report_date in report_dates:
+                result[report_date][label] = by_date.get(report_date, [])[: max(config.personalized_top_n, 5)]
         except Exception as error:
             status, error_text = classify_api_error(error)
             print(f"PERSONALIZED UX {label} {status} for {app.app_name}: {error_text}")
             for report_date in report_dates:
-                result[report_date].append(f"{label}: {status}")
+                result[report_date][label] = []
     return result
 
 
@@ -859,8 +855,9 @@ def remote_config_event_filter() -> FilterExpression:
     return or_filter([contains_filter("eventName", keyword) for keyword in keywords])
 
 
-def run_remote_config_events_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
-    result = {report_date: [] for report_date in report_dates}
+def run_remote_config_events_report(app: AppConfig, report_dates: list[str]) -> dict[str, dict[str, dict]]:
+    """Return Remote Config-related GA4 events keyed by date and event name."""
+    result: dict[str, dict[str, dict]] = {report_date: {} for report_date in report_dates}
     try:
         request = RunReportRequest(
             property=f"properties/{app.property_id}",
@@ -869,25 +866,27 @@ def run_remote_config_events_report(app: AppConfig, report_dates: list[str]) -> 
             metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
             dimension_filter=remote_config_event_filter(),
             order_bys=[date_order(), metric_order("eventCount")],
-            limit=config.remote_config_event_limit * max(len(report_dates), 1),
+            keep_empty_rows=False,
+            limit=100000,
         )
         response = beta_client.run_report(request)
         for row in parse_response_rows(response):
             report_date = ga4_date_to_iso(row.get("date", ""))
-            if report_date in result:
-                result[report_date].append(
-                    f"{row.get('eventName', '')}: Users {to_number(row.get('activeUsers', 0))}, Events {to_number(row.get('eventCount', 0))}"
-                )
+            event_name = row.get("eventName", "")
+            if report_date in result and event_name:
+                result[report_date][event_name] = {
+                    "users": to_number(row.get("activeUsers", 0)),
+                    "events": to_number(row.get("eventCount", 0)),
+                }
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"REMOTE CONFIG EVENTS {status} for {app.app_name}: {error_text}")
-        for report_date in report_dates:
-            result[report_date].append(status)
     return result
 
 
-def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
-    result = {report_date: [] for report_date in report_dates}
+def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
+    """Return the top app versions independently for every report date."""
+    result: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
     try:
         request = RunReportRequest(
             property=f"properties/{app.property_id}",
@@ -895,20 +894,24 @@ def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> d
             dimensions=[Dimension(name="date"), Dimension(name="appVersion")],
             metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="engagementRate")],
             order_bys=[date_order(), metric_order("activeUsers")],
-            limit=max(config.remote_config_app_version_limit * max(len(report_dates), 1), 100),
+            keep_empty_rows=False,
+            limit=100000,
         )
         response = beta_client.run_report(request)
         for row in parse_response_rows(response):
             report_date = ga4_date_to_iso(row.get("date", ""))
-            if report_date in result and len(result[report_date]) < config.remote_config_app_version_limit:
+            if report_date in result and len(result[report_date]) < max(config.remote_config_app_version_limit, 10):
                 result[report_date].append(
-                    f"App Version {row.get('appVersion', '(not set)')}: Users {to_number(row.get('activeUsers', 0))}, Sessions {to_number(row.get('sessions', 0))}, ER {percent(row.get('engagementRate', 0))}"
+                    {
+                        "version": row.get("appVersion", "") or "(not set)",
+                        "users": to_number(row.get("activeUsers", 0)),
+                        "sessions": to_number(row.get("sessions", 0)),
+                        "er": percent(row.get("engagementRate", 0)),
+                    }
                 )
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"REMOTE CONFIG APP VERSION {status} for {app.app_name}: {error_text}")
-        for report_date in report_dates:
-            result[report_date].append(status)
     return result
 
 
@@ -1411,34 +1414,50 @@ def fcm_delivery_to_lines(delivery: dict) -> list[str]:
     ]
 
 
-def build_fcm_delivery_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, str]:
-    result = {report_date: "" for report_date in report_dates}
+def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
+    """Return one FCM delivery record per date without creating another sheet.
+
+    If the API returns multiple analytics labels for a date, the unlabelled
+    aggregate is preferred because it matches the existing report. Otherwise,
+    the first returned label is used.
+    """
+    result: dict[str, dict] = {report_date: {} for report_date in report_dates}
     try:
         response = get_fcm_delivery_data_for_app(app)
         delivery_rows = response.get("androidDeliveryData", []) or []
-        if not delivery_rows:
-            message = "No aggregate FCM delivery rows returned for this Firebase Android app."
-            return {report_date: message for report_date in report_dates}
-
-        grouped: dict[str, list[str]] = {report_date: [] for report_date in report_dates}
+        grouped: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
         for delivery in delivery_rows:
             delivery_date = format_fcm_date(delivery.get("date", {}) or {})
-            if delivery_date not in grouped:
-                continue
-            lines = fcm_delivery_to_lines(delivery)
-            grouped[delivery_date].append(lines_to_cell([line for line in lines if not line.endswith(': ')], 30))
+            if delivery_date in grouped:
+                grouped[delivery_date].append(delivery)
 
-        for report_date in report_dates:
-            if grouped.get(report_date):
-                result[report_date] = lines_to_cell(grouped[report_date], 80)
-            else:
-                result[report_date] = "No FCM delivery data returned for this date."
+        for report_date, items in grouped.items():
+            if not items:
+                continue
+            selected = next(
+                (item for item in items if not str(item.get("analyticsLabel", "") or "").strip()),
+                items[0],
+            )
+            data = selected.get("data", {}) or {}
+            outcome = data.get("messageOutcomePercents", {}) or {}
+            performance = data.get("deliveryPerformancePercents", {}) or {}
+            label = selected.get("analyticsLabel", "") or "(no analytics label)"
+            result[report_date] = {
+                "firebase_analytics_label": label,
+                "firebase_messages_accepted": to_number(data.get("countMessagesAccepted", 0)),
+                "firebase_notifications_accepted": to_number(data.get("countNotificationsAccepted", 0)),
+                "firebase_delivered": get_percent(outcome, "delivered"),
+                "firebase_pending": get_percent(outcome, "pending"),
+                "firebase_dropped_app_force_stopped": get_percent(outcome, "droppedAppForceStopped"),
+                "firebase_dropped_device_inactive": get_percent(outcome, "droppedDeviceInactive"),
+                "firebase_delivered_no_delay": get_percent(performance, "deliveredNoDelay"),
+                "firebase_delayed_device_offline": get_percent(performance, "delayedDeviceOffline"),
+            }
         return result
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
-        message = f"{status}: {error_text}"
-        return {report_date: message for report_date in report_dates}
+        return result
 
 
 def get_event_metric(event_data: dict, report_date: str, event_name: str) -> dict:
@@ -1474,212 +1493,285 @@ def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict
         f"eventName = screen_view AND {app.screen_field} contains {app.home_screen_name}",
     )
 
-def build_session_retention_cell(metrics: dict, retention: dict) -> str:
-    return lines_to_cell(
-        [
-            f"Active Users: {metrics.get('Active Users', 0)}",
-            f"New Users: {metrics.get('New Users', 0)}",
-            f"Sessions: {metrics.get('Sessions', 0)}",
-            f"Engaged Sessions: {metrics.get('Engaged Sessions', 0)}",
-            f"Engagement Rate: {metrics.get('Engagement Rate', '0%')}",
-            f"Avg Session Duration: {metrics.get('Avg Session Duration', '0m 0s')}",
-            f"Sessions Per Active User: {metrics.get('Sessions Per Active User', 0)}",
-            f"Total Engagement Time: {metrics.get('Total Engagement Time', '0m 0s')}",
-            "Cohort Basis: First Session Date",
-            f"First-Session Cohort Total Users: {retention.get('Cohort Total Users', 0)}",
-            f"D1 First-Session Active Users: {retention.get('D1 Active Users', 0)}",
-            f"D1 First-Session Retention: {retention.get('D1 Retention', '0%')}",
-            f"D7 First-Session Active Users: {retention.get('D7 Active Users', 0)}",
-            f"D7 First-Session Retention: {retention.get('D7 Retention', '0%')}",
-        ]
-    )
+NOTIFICATION_COLUMNS = [
+    "notification_receive",
+    "notification_foreground",
+    "notification_open",
+    "notification_dismiss",
+]
 
+FCM_COLUMNS = [
+    "firebase_analytics_label",
+    "firebase_messages_accepted",
+    "firebase_notifications_accepted",
+    "firebase_delivered",
+    "firebase_pending",
+    "firebase_dropped_app_force_stopped",
+    "firebase_dropped_device_inactive",
+    "firebase_delivered_no_delay",
+    "firebase_delayed_device_offline",
+]
 
-def build_basic_funnel_cell(report_date: str, app: AppConfig, event_data: dict, home_data: dict, feature_events: list[str]) -> str:
-    app_open_events = split_csv(app.app_open_event_names)
-    app_open_event, app_open_data = pick_first_available_event(event_data, report_date, app_open_events)
-    app_open_users = to_number(app_open_data.get("active_users", 0))
-    app_open_count = to_number(app_open_data.get("event_count", 0))
+AUDIENCE_SEGMENTS = [
+    ("All Users", "all_users"),
+    ("US Users", "us_users"),
+    ("Direct Traffic", "direct_traffic"),
+    ("Paid Traffic", "paid_traffic"),
+    ("Mobile Traffic", "mobile_traffic"),
+    ("Tablet Traffic", "tablet_traffic"),
+]
 
-    home_event, home_users, home_views, home_match = get_home_metrics_for_date(report_date, app, event_data, home_data)
-    possible_drop_off = max(int(to_float(app_open_users) - to_float(home_users)), 0)
+REMOTE_EVENT_COLUMNS = [
+    "dn_rc_inter_clicked",
+    "dn_rc_inter_displayed",
+    "dn_rc_inter_loaded",
+    "dn_rc_inter_requested",
+    "dn_rc_inter_dismissed",
+]
 
-    lines = [
-        f"App Open Event: {app_open_event or 'not configured'}",
-        f"App Open Users: {app_open_users}",
-        f"App Open Events: {app_open_count}",
-        f"Home Event/Screen: {home_event or 'not configured'}",
-        f"Home Users: {home_users}",
-        f"Home Events / Views: {home_views}",
-        f"Possible Drop Off: {possible_drop_off}",
-        f"Home Reach Rate: {rate(home_users, app_open_users)}",
-        f"Home Match: {home_match}",
-    ]
-
-    feature_lines = []
-    for event_name in feature_events:
-        if event_name in app_open_events or event_name in split_csv(app.home_event_names):
-            continue
-        data = get_event_metric(event_data, report_date, event_name)
-        count = data.get("event_count", 0)
-        users = data.get("active_users", 0)
-        if count or users:
-            feature_lines.append(f"{event_name}: Events {count}, Users {users}")
-    if feature_lines:
-        lines.append("Feature Events:")
-        lines.extend(feature_lines)
-    else:
-        lines.append("Feature Events: No configured feature events found for this date")
-    return lines_to_cell(lines, 80)
-
-
-def build_audience_cell(segments: list[dict]) -> str:
-    return lines_to_cell(
-        [f"{item['segment']}: Users {item.get('active', 0)}, Sessions {item.get('sessions', 0)}, ER {item.get('engagement', '0%')}" for item in segments]
-    )
-
-
-def build_remote_config_cell(dynamic_events: list[str], app_versions: list[str], static_summary: str) -> str:
-    lines = []
-    if static_summary:
-        lines.append(static_summary)
-    if dynamic_events:
-        lines.append("GA4 Config Events:")
-        lines.extend(dynamic_events)
-    if app_versions:
-        lines.append("App Version Impact:")
-        lines.extend(app_versions[:10])
-    return lines_to_cell(lines, 60)
-
-
-def build_daily_notifications_cell(static_notifications: str, event_data: dict, report_date: str, notification_events: list[str]) -> str:
-    lines = []
-    if static_notifications:
-        lines.append("Configured Daily Notifications:")
-        lines.extend(static_notifications.split("\n"))
-    event_lines = []
-    for event_name in notification_events:
-        data = event_data.get((report_date, event_name), {})
-        count = data.get("event_count", 0)
-        users = data.get("active_users", 0)
-        if count or users:
-            event_lines.append(f"{event_name}: Events {count}, Users {users}")
-    if event_lines:
-        lines.append("GA4 Notification Events:")
-        lines.extend(event_lines)
-    return lines_to_cell(lines, 60)
-
-
-def remove_empty_and_duplicate_columns(rows: list[list]) -> list[list]:
-    if not rows or not rows[0]:
-        return rows
-    header = [str(value).strip() for value in rows[0]]
-    protected = {"Package Name", "Date"}
-    keep_indexes = []
-    seen_signatures: dict[tuple[str, ...], str] = {}
-    for index, column_name in enumerate(header):
-        values = tuple(str(row[index]).strip() if index < len(row) else "" for row in rows[1:])
-        if column_name in protected:
-            keep_indexes.append(index)
-            continue
-        if all(value == "" for value in values):
-            print(f"Removed empty column: {column_name}")
-            continue
-        if values in seen_signatures:
-            print(f"Removed duplicate-data column: {column_name} = {seen_signatures[values]}")
-            continue
-        seen_signatures[values] = column_name
-        keep_indexes.append(index)
-    return [[row[index] if index < len(row) else "" for index in keep_indexes] for row in rows]
-
-
-REPORT_HEADERS = [
-    "Daily Notifications",
-    "Firebase Notification Delivery",
-    "Audience Segments",
-    "Basic Funnel Analysis",
-    "Remote Configuration",
-    "A/B Test on Time Capping",
-    "A/B Test on IAPs Screen",
-    "First-Session Retention and Session Time Analysis",
-    "Personalized User Experience",
+PERSONALIZED_COLUMN_SPECS = [
+    ("Country", "country", "country"),
+    ("Language", "language", "language"),
+    ("Device Category", "device_category", "device_category"),
+    ("Operating System", "operating_system", "operating_system"),
+    ("App Version", "app_version", "app_version"),
+    ("First User Medium", "first_user_medium", "first_user_medium"),
+    ("Top Screens / Screen Class", "screen", "screen_class"),
 ]
 
 
-def split_report_cell_items(cell_value: str, split_grouped_values: bool = False) -> list[str]:
-    """Expand a multi-line report cell into individual row values.
+def build_output_headers() -> list[str]:
+    headers = ["Package Name", "Date"]
+    headers.extend(NOTIFICATION_COLUMNS)
+    headers.extend(FCM_COLUMNS)
 
-    The sheet columns remain unchanged. Package Name and Date are repeated on
-    every expanded row. For grouped Personalized User Experience lines such as
-    ``Country: Ukraine (...); Uzbekistan (...)``, each value becomes its own
-    row while retaining the dimension label.
-    """
-    text = str(cell_value or "").strip()
-    if not text:
-        return []
-
-    items: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        if split_grouped_values and ": " in line:
-            label, grouped_text = line.split(": ", 1)
-            grouped_items = [part.strip() for part in grouped_text.split("; ") if part.strip()]
-            if len(grouped_items) > 1:
-                items.extend(f"{label}: {part}" for part in grouped_items)
-                continue
-
-        items.append(line)
-    return items
-
-
-def expand_report_columns(package_name: str, report_date: str, cells: list[str]) -> list[list]:
-    """Write each section item on a separate row without changing headers.
-
-    Items are aligned vertically by their position inside each existing report
-    column. No Section/Category/Item columns are introduced.
-    """
-    expanded_columns: list[list[str]] = []
-    for header, cell in zip(REPORT_HEADERS, cells):
-        expanded_columns.append(
-            split_report_cell_items(
-                cell,
-                split_grouped_values=(header == "Personalized User Experience"),
-            )
+    for _, slug in AUDIENCE_SEGMENTS:
+        headers.extend(
+            [
+                f"audience_{slug}/users",
+                f"audience_{slug}/sessions",
+                f"audience_{slug}/er",
+            ]
         )
 
-    row_count = max((len(values) for values in expanded_columns), default=0)
-    if row_count == 0:
-        row_count = 1
+    headers.extend(
+        [
+            "funnel_app_open_users",
+            "funnel_app_open_events",
+            "funnel_home_users",
+            "funnel_home_events_views",
+            "funnel_possible_drop_off",
+            "funnel_home_reach_rate",
+            "funnel_ad_impression/events",
+            "funnel_ad_impression/users",
+            "funnel_in_app_purchase/events",
+            "funnel_in_app_purchase/users",
+            "remote_template_version",
+            "remote_last_published_at",
+            "remote_total_parameters",
+        ]
+    )
 
-    rows: list[list] = []
-    for row_index in range(row_count):
-        row = [package_name, report_date]
-        for values in expanded_columns:
-            row.append(values[row_index] if row_index < len(values) else "")
-        rows.append(row)
-    return rows
+    for event_name in REMOTE_EVENT_COLUMNS:
+        headers.extend(
+            [
+                f"remote_{event_name}/users",
+                f"remote_{event_name}/events",
+            ]
+        )
+
+    for rank in range(1, 11):
+        headers.extend(
+            [
+                f"remote_app_version_{rank}/version",
+                f"remote_app_version_{rank}/users",
+                f"remote_app_version_{rank}/sessions",
+                f"remote_app_version_{rank}/er",
+            ]
+        )
+
+    headers.extend(
+        [
+            "A/B Test on Time Capping",
+            "A/B Test on IAPs Screen",
+            "time_analysis_active_users",
+            "time_analysis_new_users",
+            "time_analysis_sessions",
+            "time_analysis_engaged_sessions",
+            "time_analysis_engagement_rate",
+            "time_analysis_avg_session_duration",
+            "time_analysis_sessions_per_active_user",
+            "time_analysis_total_engagement_time",
+            "retention_first_session_cohort_total_users",
+            "retention_d1_first_session_active_users",
+            "retention_d1_first_session_retention",
+            "retention_d7_first_session_active_users",
+            "retention_d7_first_session_retention",
+        ]
+    )
+
+    for _, slug, value_name in PERSONALIZED_COLUMN_SPECS:
+        for rank in range(1, 6):
+            headers.extend(
+                [
+                    f"personalized_{slug}_{rank}/{value_name}",
+                    f"personalized_{slug}_{rank}/users",
+                    f"personalized_{slug}_{rank}/sessions",
+                    f"personalized_{slug}_{rank}/er",
+                    f"personalized_{slug}_{rank}/avg",
+                ]
+            )
+
+    if len(headers) != len(set(headers)):
+        duplicates = sorted({name for name in headers if headers.count(name) > 1})
+        raise ValueError(f"Duplicate output headers found: {duplicates}")
+    return headers
+
+
+OUTPUT_HEADERS = build_output_headers()
+
+
+def parse_remote_static_fields(static_summary: str) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "remote_template_version": "",
+        "remote_last_published_at": "",
+        "remote_total_parameters": "",
+    }
+    for raw_line in str(static_summary or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("Template Version:"):
+            fields["remote_template_version"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Last Published At:"):
+            fields["remote_last_published_at"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Total Parameters:"):
+            value = line.split(":", 1)[1].strip()
+            fields["remote_total_parameters"] = to_number(value)
+    return fields
+
+
+def set_audience_columns(row: dict, segments: list[dict]):
+    segment_map = {item.get("segment", ""): item for item in segments}
+    for segment_name, slug in AUDIENCE_SEGMENTS:
+        item = segment_map.get(segment_name, {})
+        row[f"audience_{slug}/users"] = item.get("active", 0)
+        row[f"audience_{slug}/sessions"] = item.get("sessions", 0)
+        row[f"audience_{slug}/er"] = item.get("engagement", "0%")
+
+
+def set_funnel_columns(
+    row: dict,
+    report_date: str,
+    app: AppConfig,
+    event_data: dict,
+    home_data: dict,
+):
+    app_open_event, app_open_data = pick_first_available_event(
+        event_data,
+        report_date,
+        split_csv(app.app_open_event_names),
+    )
+    app_open_users = to_number(app_open_data.get("active_users", 0))
+    app_open_events = to_number(app_open_data.get("event_count", 0))
+    _, home_users, home_views, _ = get_home_metrics_for_date(
+        report_date,
+        app,
+        event_data,
+        home_data,
+    )
+
+    row["funnel_app_open_users"] = app_open_users
+    row["funnel_app_open_events"] = app_open_events
+    row["funnel_home_users"] = home_users
+    row["funnel_home_events_views"] = home_views
+    row["funnel_possible_drop_off"] = max(
+        int(to_float(app_open_users) - to_float(home_users)),
+        0,
+    )
+    row["funnel_home_reach_rate"] = rate(home_users, app_open_users)
+
+    for event_name in ("ad_impression", "in_app_purchase"):
+        data = get_event_metric(event_data, report_date, event_name)
+        row[f"funnel_{event_name}/events"] = to_number(data.get("event_count", 0))
+        row[f"funnel_{event_name}/users"] = to_number(data.get("active_users", 0))
+
+
+def set_remote_columns(
+    row: dict,
+    remote_static: str,
+    remote_events: dict[str, dict],
+    remote_versions: list[dict],
+):
+    row.update(parse_remote_static_fields(remote_static))
+
+    for event_name in REMOTE_EVENT_COLUMNS:
+        data = remote_events.get(event_name, {})
+        row[f"remote_{event_name}/users"] = data.get("users", 0)
+        row[f"remote_{event_name}/events"] = data.get("events", 0)
+
+    for rank in range(1, 11):
+        item = remote_versions[rank - 1] if rank <= len(remote_versions) else {}
+        row[f"remote_app_version_{rank}/version"] = item.get("version", "")
+        row[f"remote_app_version_{rank}/users"] = item.get("users", "")
+        row[f"remote_app_version_{rank}/sessions"] = item.get("sessions", "")
+        row[f"remote_app_version_{rank}/er"] = item.get("er", "")
+
+
+def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
+    row["time_analysis_active_users"] = metrics.get("Active Users", 0)
+    row["time_analysis_new_users"] = metrics.get("New Users", 0)
+    row["time_analysis_sessions"] = metrics.get("Sessions", 0)
+    row["time_analysis_engaged_sessions"] = metrics.get("Engaged Sessions", 0)
+    row["time_analysis_engagement_rate"] = metrics.get("Engagement Rate", "0%")
+    row["time_analysis_avg_session_duration"] = metrics.get("Avg Session Duration", "0m 0s")
+    row["time_analysis_sessions_per_active_user"] = metrics.get("Sessions Per Active User", 0)
+    row["time_analysis_total_engagement_time"] = metrics.get("Total Engagement Time", "0m 0s")
+
+    row["retention_first_session_cohort_total_users"] = retention.get("Cohort Total Users", "Not available yet")
+    row["retention_d1_first_session_active_users"] = retention.get("D1 Active Users", "Not available yet")
+    row["retention_d1_first_session_retention"] = retention.get("D1 Retention", "Not available yet")
+    row["retention_d7_first_session_active_users"] = retention.get("D7 Active Users", "Not available yet")
+    row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available yet")
+
+
+def set_personalized_columns(row: dict, personalized_data: dict[str, list[dict]]):
+    for label, slug, value_name in PERSONALIZED_COLUMN_SPECS:
+        items = personalized_data.get(label, [])
+        for rank in range(1, 6):
+            item = items[rank - 1] if rank <= len(items) else {}
+            row[f"personalized_{slug}_{rank}/{value_name}"] = item.get("value", "")
+            row[f"personalized_{slug}_{rank}/users"] = item.get("active", "")
+            row[f"personalized_{slug}_{rank}/sessions"] = item.get("sessions", "")
+            row[f"personalized_{slug}_{rank}/er"] = item.get("engagement", "")
+            row[f"personalized_{slug}_{rank}/avg"] = item.get("avg", "")
 
 
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
     print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
-    notification_events = split_csv(config.notification_event_names)
+
+    notification_events = list(NOTIFICATION_COLUMNS)
     feature_events = split_csv(app.feature_event_names)
     app_open_events = split_csv(app.app_open_event_names)
     home_event_names = split_csv(app.home_event_names)
-    event_names = split_csv(",".join(notification_events + feature_events + app_open_events + home_event_names))
+    required_funnel_events = ["ad_impression", "in_app_purchase"]
+    event_names = split_csv(
+        ",".join(
+            notification_events
+            + feature_events
+            + required_funnel_events
+            + app_open_events
+            + home_event_names
+        )
+    )
 
-    daily_metrics = {}
-    event_data = {}
-    home_data = {}
-    retention_data = {}
+    daily_metrics: dict[str, dict] = {}
+    event_data: dict[tuple[str, str], dict] = {}
+    home_data: dict[str, dict] = {}
+    retention_data: dict[str, dict] = {}
     audience_segments = {report_date: [] for report_date in report_dates}
-    personalized_ux = {report_date: [] for report_date in report_dates}
-    remote_events = {report_date: [] for report_date in report_dates}
-    remote_versions = {report_date: [] for report_date in report_dates}
-    fcm_delivery = {report_date: "" for report_date in report_dates}
+    personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
+    remote_events: dict[str, dict[str, dict]] = {report_date: {} for report_date in report_dates}
+    remote_versions: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
     static_remote = get_remote_config_static_summaries(app)
 
     try:
@@ -1724,37 +1816,45 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
         status, error_text = classify_api_error(error)
         print(f"REMOTE CONFIG APP VERSIONS {status} for {app.app_name}: {error_text}")
     try:
-        fcm_delivery = build_fcm_delivery_by_date(app, report_dates)
+        fcm_delivery = build_fcm_delivery_fields_by_date(app, report_dates)
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
 
     rows: list[list] = []
     for report_date in report_dates:
-        metrics = daily_metrics.get(report_date, {})
-        retention = retention_data.get(report_date, {})
-        report_cells = [
-            build_daily_notifications_cell(
-                static_remote.get("daily_notifications_static", ""),
-                event_data,
-                report_date,
-                notification_events,
-            ),
-            fcm_delivery.get(report_date, ""),
-            build_audience_cell(audience_segments.get(report_date, [])),
-            build_basic_funnel_cell(report_date, app, event_data, home_data, feature_events),
-            build_remote_config_cell(
-                remote_events.get(report_date, []),
-                remote_versions.get(report_date, []),
-                static_remote.get("remote_config_static", ""),
-            ),
-            static_remote.get("time_capping", ""),
-            static_remote.get("iap_screen", ""),
-            build_session_retention_cell(metrics, retention),
-            lines_to_cell(personalized_ux.get(report_date, []), 80),
-        ]
-        rows.extend(expand_report_columns(package_name, report_date, report_cells))
+        row = {header: "" for header in OUTPUT_HEADERS}
+        row["Package Name"] = package_name
+        row["Date"] = report_date
+
+        for event_name in NOTIFICATION_COLUMNS:
+            data = get_event_metric(event_data, report_date, event_name)
+            row[event_name] = (
+                f"Events: {to_number(data.get('event_count', 0))} | "
+                f"Users: {to_number(data.get('active_users', 0))}"
+            )
+
+        row.update(fcm_delivery.get(report_date, {}))
+        set_audience_columns(row, audience_segments.get(report_date, []))
+        set_funnel_columns(row, report_date, app, event_data, home_data)
+        set_remote_columns(
+            row,
+            static_remote.get("remote_config_static", ""),
+            remote_events.get(report_date, {}),
+            remote_versions.get(report_date, []),
+        )
+        row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
+        row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
+        set_time_and_retention_columns(
+            row,
+            daily_metrics.get(report_date, {}),
+            retention_data.get(report_date, {}),
+        )
+        set_personalized_columns(row, personalized_ux.get(report_date, {}))
+
+        rows.append([row.get(header, "") for header in OUTPUT_HEADERS])
     return rows
+
 
 def main():
     print("Reading app list from Apps Config sheet...")
@@ -1763,8 +1863,7 @@ def main():
     print(f"Total enabled apps found: {len(apps)}")
     print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
 
-    header = ["Package Name", "Date", *REPORT_HEADERS]
-    rows = [header]
+    rows = [OUTPUT_HEADERS]
 
     for app in apps:
         package_name = fetch_ga4_package_name(app)
@@ -1774,7 +1873,6 @@ def main():
             print(f"Package name not found for {app.app_name}; final Package Name cell will be blank.")
         rows.extend(build_rows_for_app(app, report_dates, package_name))
 
-    # Keep the original report columns exactly as defined above.
     write_sheet(config.merged_sheet, rows)
 
     date_chunks = (len(report_dates) + 11) // 12
@@ -1783,7 +1881,7 @@ def main():
         approx_ga4_calls_per_app += 1
     print("Done. Only GA4 Merged Data was updated.")
     print(f"Merged Sheet: {config.merged_sheet}")
-    print(f"Expanded rows written: {len(rows) - 1}")
+    print(f"Package-date rows written: {len(rows) - 1}")
     print(f"Approx GA4 Data API calls per app: {approx_ga4_calls_per_app}")
     print("Firebase Remote Config calls: about 1 per unique Firebase Project ID, cached and reused for Time Capping, IAP Screen, Daily Notifications, and Remote Configuration.")
     print("FCM Data API calls: about 1 per unique Firebase Android App ID, cached and written inside GA4 Merged Data.")
