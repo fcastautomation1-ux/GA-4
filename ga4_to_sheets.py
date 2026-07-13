@@ -727,7 +727,7 @@ def _collect_audience_definition_fields(
 
 
 def fetch_ga4_audience_definitions(app: AppConfig) -> dict[str, dict]:
-    """List audiences from GA4 Admin > Data display > Audiences."""
+    """List active audiences from GA4 Admin > Data display > Audiences."""
     property_id = str(app.property_id).strip()
     if property_id in ga4_audience_definition_cache:
         return ga4_audience_definition_cache[property_id]
@@ -768,6 +768,8 @@ def fetch_ga4_audience_definitions(app: AppConfig) -> dict[str, dict]:
                 definition = {
                     "resource_name": resource_name,
                     "display_name": display_name,
+                    "description": str(audience.get("description", "")).strip(),
+                    "create_time": str(audience.get("createTime", "")).strip(),
                     "events_name": ", ".join(event_names),
                     "countries": ", ".join(countries),
                 }
@@ -789,24 +791,31 @@ def fetch_ga4_audience_definitions(app: AppConfig) -> dict[str, dict]:
 
 
 def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
-    """Return configured GA4 audiences with country-level total users.
+    """Return the audiences shown in GA4 Admin for the selected date range.
 
-    Audience names and configured event conditions come from the GA4 Admin API.
-    Country and Total_Users come from a separate GA4 Data API report. This avoids
-    requesting eventName together with audience dimensions, which can return an
-    empty or incompatible report.
+    The active audience list, configured event conditions, and configured
+    country conditions come from the GA4 Admin API. Total_Users is queried once
+    for the complete START_DATE-to-END_DATE range without date or country
+    breakdowns so it matches the range-level Total users value shown in the
+    Admin audience management table.
     """
     definitions = fetch_ga4_audience_definitions(app)
-    definitions_by_name = {
-        item.get("display_name", ""): item
+    by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    if not definitions:
+        return by_date
+
+    definitions_by_resource = {
+        str(item.get("resource_name", "")).strip(): item
         for item in definitions.values()
-        if item.get("display_name", "")
+        if str(item.get("resource_name", "")).strip()
+    }
+    definitions_by_name = {
+        str(item.get("display_name", "")).strip(): item
+        for item in definitions.values()
+        if str(item.get("display_name", "")).strip()
     }
 
-    by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    seen_audiences_by_date: dict[str, set[str]] = {
-        report_date: set() for report_date in report_dates
-    }
+    totals_by_key: dict[str, float] = {}
     page_size = 100000
     offset = 0
 
@@ -815,12 +824,11 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
             property=f"properties/{app.property_id}",
             date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
             dimensions=[
-                Dimension(name="date"),
+                Dimension(name="audienceResourceName"),
                 Dimension(name="audienceName"),
-                Dimension(name="country"),
             ],
             metrics=[Metric(name="totalUsers")],
-            order_bys=[date_order(), metric_order("totalUsers")],
+            order_bys=[metric_order("totalUsers")],
             keep_empty_rows=False,
             limit=page_size,
             offset=offset,
@@ -831,57 +839,67 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
             break
 
         for row in page_rows:
-            report_date = ga4_date_to_iso(row.get("date", ""))
-            if report_date not in by_date:
-                continue
-
+            resource_name = str(row.get("audienceResourceName", "")).strip()
             reported_name = str(row.get("audienceName", "")).strip()
             if reported_name in {"", "(not set)"}:
                 continue
 
-            definition = definitions_by_name.get(reported_name, {})
-            audience_name = definition.get("display_name", "") or reported_name
-            if not audience_name or audience_name == "(not set)":
+            # Only include audiences currently visible in Admin > Data display
+            # > Audiences. This excludes archived or historical audience rows.
+            definition = definitions_by_resource.get(resource_name)
+            if definition is None:
+                definition = definitions_by_name.get(reported_name)
+            if definition is None:
                 continue
 
-            seen_audiences_by_date[report_date].add(audience_name)
-            by_date[report_date].append(
-                {
-                    "Audien Name": audience_name,
-                    "Events Name": definition.get("events_name", ""),
-                    "Countries": row.get("country", "") or "(not set)",
-                    "Total_Users": to_number(row.get("totalUsers", 0)),
-                }
+            key = (
+                str(definition.get("resource_name", "")).strip()
+                or str(definition.get("display_name", "")).strip()
+            )
+            totals_by_key[key] = totals_by_key.get(key, 0.0) + to_float(
+                row.get("totalUsers", 0)
             )
 
         if len(page_rows) < page_size:
             break
         offset += len(page_rows)
 
-    # Keep every configured audience visible even when no user row exists for
-    # a date. Definition-level countries are used only as a zero-user fallback.
-    for report_date in report_dates:
-        seen = seen_audiences_by_date[report_date]
-        for definition in definitions.values():
-            audience_key = definition.get("display_name", "")
-            if not audience_key or audience_key in seen:
-                continue
-            by_date[report_date].append(
-                {
-                    "Audien Name": definition.get("display_name", ""),
-                    "Events Name": definition.get("events_name", ""),
-                    "Countries": definition.get("countries", ""),
-                    "Total_Users": 0,
-                }
-            )
+    summary_rows: list[dict] = []
+    for definition in definitions.values():
+        audience_name = str(definition.get("display_name", "")).strip()
+        if not audience_name:
+            continue
 
-        by_date[report_date].sort(
-            key=lambda item: (
-                -to_float(item.get("Total_Users", 0)),
-                str(item.get("Audien Name", "")).lower(),
-                str(item.get("Countries", "")).lower(),
-            )
+        key = (
+            str(definition.get("resource_name", "")).strip()
+            or audience_name
         )
+        summary_rows.append(
+            {
+                "Audien Name": audience_name,
+                "Events Name": definition.get("events_name", ""),
+                "Countries": definition.get("countries", ""),
+                "Total_Users": to_number(totals_by_key.get(key, 0)),
+                "_create_time": definition.get("create_time", ""),
+            }
+        )
+
+    # The screenshot is sorted by Created On descending. Keep the same order,
+    # while using the audience name as a deterministic fallback.
+    summary_rows.sort(
+        key=lambda item: (
+            str(item.get("_create_time", "")),
+            str(item.get("Audien Name", "")).lower(),
+        ),
+        reverse=True,
+    )
+    for item in summary_rows:
+        item.pop("_create_time", None)
+
+    # The merged sheet is date-keyed. Repeat the same range-level Admin audience
+    # rows in each date block so the existing sheet structure remains stable.
+    for report_date in report_dates:
+        by_date[report_date] = [dict(item) for item in summary_rows]
 
     return by_date
 
