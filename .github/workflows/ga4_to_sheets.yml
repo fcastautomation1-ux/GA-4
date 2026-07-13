@@ -3,8 +3,7 @@ name: GA4 to Google Sheets
 on:
   workflow_dispatch
 
-
-
+ 
 jobs:
   ga4-to-sheets:
     runs-on: ubuntu-latest
@@ -37,16 +36,12 @@ jobs:
           DEFAULT_HOME_SCREEN_NAME: ${{ vars.DEFAULT_HOME_SCREEN_NAME || 'MainActivity' }}
           DEFAULT_SCREEN_FIELD: ${{ vars.DEFAULT_SCREEN_FIELD || 'unifiedPagePathScreen' }}
 
-          NOTIFICATION_EVENT_NAMES: ${{ vars.NOTIFICATION_EVENT_NAMES || 'notification_receive,notification_foreground,notification_open,notification_dismiss' }}
           KEY_EVENT_NAMES: ${{ vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
           APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
           HOME_EVENT_NAMES: ${{ vars.HOME_EVENT_NAMES || '' }}
           FEATURE_EVENT_NAMES: ${{ vars.FEATURE_EVENT_NAMES || vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
-          NOTIFICATION_PARAMETER_KEYWORDS: ${{ vars.NOTIFICATION_PARAMETER_KEYWORDS || 'notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm,title,body,message,time' }}
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
-          REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
-          REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '0' }}
 
           TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
           IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
@@ -54,9 +49,6 @@ jobs:
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
           FIREBASE_REMOTE_CONFIG_API_BASE: ${{ vars.FIREBASE_REMOTE_CONFIG_API_BASE || 'https://firebaseremoteconfig.googleapis.com/v1' }}
           FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
-          FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
-          FIREBASE_MANAGEMENT_API_BASE: ${{ vars.FIREBASE_MANAGEMENT_API_BASE || 'https://firebase.googleapis.com/v1beta1' }}
-          FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
 
           FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
           CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
