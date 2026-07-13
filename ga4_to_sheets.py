@@ -3,7 +3,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -39,7 +38,6 @@ class AppConfig:
     firebase_project_name: str
     firebase_app_id: str
     time_capping_parameter: str
-    daily_notification_parameters: str
     iap_screen_parameter: str
     app_open_event_names: str
     home_event_names: str
@@ -55,11 +53,8 @@ credentials = get_credentials()
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
 analytics_admin_session = None
 remote_config_session = None
-notification_api_session = None
 package_name_cache: dict[str, str] = {}
 remote_config_template_cache: dict[str, dict] = {}
-fcm_delivery_cache: dict[tuple[str, str], dict] = {}
-firebase_android_apps_cache: dict[str, list[dict]] = {}
 
 MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
 OLD_REPORT_SHEET_NAMES = {
@@ -225,7 +220,6 @@ def read_apps_config() -> list[AppConfig]:
                 firebase_project_name=(row[6].strip() if len(row) > 6 else ""),
                 firebase_app_id=(row[7].strip() if len(row) > 7 else ""),
                 time_capping_parameter=(row[8].strip() if len(row) > 8 else ""),
-                daily_notification_parameters=(row[9].strip() if len(row) > 9 else ""),
                 iap_screen_parameter=(row[10].strip() if len(row) > 10 else ""),
                 app_open_event_names=(row[11].strip() if len(row) > 11 and row[11].strip() else config.app_open_event_names),
                 home_event_names=(row[12].strip() if len(row) > 12 else ""),
@@ -322,13 +316,6 @@ def format_seconds(seconds_value) -> str:
     if hours:
         return f"{hours}h {minutes}m {seconds}s"
     return f"{minutes}m {seconds}s"
-
-
-def lines_to_cell(lines: list[str], max_lines: int = 50) -> str:
-    clean = [str(line).strip() for line in lines if str(line).strip()]
-    if len(clean) > max_lines:
-        clean = clean[:max_lines] + [f"... {len(clean) - max_lines} more rows trimmed"]
-    return "\n".join(clean)
 
 
 def classify_api_error(error) -> tuple[str, str]:
@@ -838,84 +825,6 @@ def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, di
     return result
 
 
-def remote_config_event_filter() -> FilterExpression:
-    keywords = [
-        "remote_config",
-        "remote config",
-        "config",
-        "experiment",
-        "variant",
-        "feature_flag",
-        "featureflag",
-        "ab_test",
-        "abtest",
-        "firebase_exp",
-        "rc_",
-    ]
-    return or_filter([contains_filter("eventName", keyword) for keyword in keywords])
-
-
-def run_remote_config_events_report(app: AppConfig, report_dates: list[str]) -> dict[str, dict[str, dict]]:
-    """Return Remote Config-related GA4 events keyed by date and event name."""
-    result: dict[str, dict[str, dict]] = {report_date: {} for report_date in report_dates}
-    try:
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-            dimensions=[Dimension(name="date"), Dimension(name="eventName")],
-            metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-            dimension_filter=remote_config_event_filter(),
-            order_bys=[date_order(), metric_order("eventCount")],
-            keep_empty_rows=False,
-            limit=100000,
-        )
-        response = beta_client.run_report(request)
-        for row in parse_response_rows(response):
-            report_date = ga4_date_to_iso(row.get("date", ""))
-            event_name = row.get("eventName", "")
-            if report_date in result and event_name:
-                result[report_date][event_name] = {
-                    "users": to_number(row.get("activeUsers", 0)),
-                    "events": to_number(row.get("eventCount", 0)),
-                }
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"REMOTE CONFIG EVENTS {status} for {app.app_name}: {error_text}")
-    return result
-
-
-def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
-    """Return the top app versions independently for every report date."""
-    result: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    try:
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-            dimensions=[Dimension(name="date"), Dimension(name="appVersion")],
-            metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="engagementRate")],
-            order_bys=[date_order(), metric_order("activeUsers")],
-            keep_empty_rows=False,
-            limit=100000,
-        )
-        response = beta_client.run_report(request)
-        for row in parse_response_rows(response):
-            report_date = ga4_date_to_iso(row.get("date", ""))
-            version_limit = config.remote_config_app_version_limit
-            if report_date in result and (version_limit <= 0 or len(result[report_date]) < version_limit):
-                result[report_date].append(
-                    {
-                        "version": row.get("appVersion", "") or "(not set)",
-                        "users": to_number(row.get("activeUsers", 0)),
-                        "sessions": to_number(row.get("sessions", 0)),
-                        "er": percent(row.get("engagementRate", 0)),
-                    }
-                )
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"REMOTE CONFIG APP VERSION {status} for {app.app_name}: {error_text}")
-    return result
-
-
 def get_remote_config_session():
     global remote_config_session
     if remote_config_session is None:
@@ -989,30 +898,6 @@ def find_remote_config_parameter(template: dict, parameter_key: str) -> tuple[st
         if wanted_lower in key_lower or key_lower in wanted_lower:
             return key, parameter, group_name
     return wanted, None, ""
-
-
-def extract_experiment_ids(value: str) -> str:
-    text = str(value or "")
-    ids = []
-    for pattern in [r"experiment[_-]?id['\"\s:=]+([A-Za-z0-9_.:-]+)", r"variant[_-]?id['\"\s:=]+([A-Za-z0-9_.:-]+)"]:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            ids.append(match.group(1))
-    return ", ".join(dict.fromkeys(ids))
-
-
-def summarize_parameter_values(parameter_key: str, parameter: dict, group_name: str = "") -> list[str]:
-    value_type = parameter.get("valueType", "") if parameter else ""
-    lines = []
-    for value_row in get_parameter_values(parameter or {}):
-        value = value_row["value"]
-        if value == "":
-            continue
-        condition = f" / {value_row['condition']}" if value_row.get("condition") else ""
-        group = f" / Group {group_name}" if group_name else ""
-        exp = extract_experiment_ids(value)
-        exp_text = f" / Experiment {exp}" if exp else ""
-        lines.append(f"{parameter_key}{group} | {value_row['source']}{condition} | {value_type} | {value}{exp_text}")
-    return lines
 
 
 def get_remote_config_condition_map(template: dict) -> dict[str, str]:
@@ -1148,101 +1033,8 @@ def find_iap_parameters(template: dict, explicit_key: str) -> list[tuple[str, di
     return matches
 
 
-def get_notification_parameter_keys(app: AppConfig) -> list[str]:
-    return split_csv(app.daily_notification_parameters) or split_csv(config.notification_parameter_keywords)
-
-
-def is_notification_parameter_key(parameter_key: str, explicit_or_keywords: list[str]) -> bool:
-    key_lower = parameter_key.lower()
-    return any(item.lower() in key_lower for item in explicit_or_keywords if item)
-
-
-def try_json(value: str):
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for candidate in [text, text.replace("'", '"')]:
-        try:
-            return json.loads(candidate)
-        except Exception:
-            continue
-    return None
-
-
-def find_key_value_recursive(data, keys: list[str]) -> str:
-    if isinstance(data, dict):
-        for wanted in keys:
-            for key, value in data.items():
-                if wanted in str(key).lower():
-                    if isinstance(value, (str, int, float)):
-                        return str(value)
-                    return json.dumps(value, ensure_ascii=False)
-        for value in data.values():
-            found = find_key_value_recursive(value, keys)
-            if found:
-                return found
-    elif isinstance(data, list):
-        for value in data:
-            found = find_key_value_recursive(value, keys)
-            if found:
-                return found
-    return ""
-
-
-def extract_notification_details(raw_value: str) -> str:
-    text = str(raw_value or "")
-    parsed = try_json(text)
-    if parsed is not None:
-        title = find_key_value_recursive(parsed, ["title", "heading", "subject"])
-        body = find_key_value_recursive(parsed, ["body", "message", "content", "text"])
-        send_time = find_key_value_recursive(parsed, ["send_time", "sendtime", "time", "hour", "schedule"])
-        days = find_key_value_recursive(parsed, ["days", "repeat", "weekday"])
-        parts = []
-        if title:
-            parts.append(f"Title: {title}")
-        if body:
-            parts.append(f"Body: {body}")
-        if send_time:
-            parts.append(f"Time: {send_time}")
-        if days:
-            parts.append(f"Days: {days}")
-        if parts:
-            return ", ".join(parts)
-    title_match = re.search(r"(?:title|heading)\s*[:=]\s*([^|,;]+)", text, flags=re.IGNORECASE)
-    body_match = re.search(r"(?:body|message|content)\s*[:=]\s*([^|;]+)", text, flags=re.IGNORECASE)
-    time_match = re.search(r"(?:time|send_time|schedule)\s*[:=]\s*([0-9]{1,2}[:.]?[0-9]{0,2}\s*(?:am|pm)?|[^|,;]+)", text, flags=re.IGNORECASE)
-    parts = []
-    if title_match:
-        parts.append(f"Title: {title_match.group(1).strip()}")
-    if body_match:
-        parts.append(f"Body: {body_match.group(1).strip()}")
-    if time_match:
-        parts.append(f"Time: {time_match.group(1).strip()}")
-    return ", ".join(parts) if parts else text[:300]
-
-
-def summarize_daily_notifications_from_template(app: AppConfig, template: dict) -> str:
-    keys_or_keywords = get_notification_parameter_keys(app)
-    lines = []
-    for key, parameter, group_name in iter_remote_config_parameters(template):
-        if not is_notification_parameter_key(key, keys_or_keywords):
-            continue
-        for value_row in get_parameter_values(parameter):
-            value = value_row["value"]
-            if value == "":
-                continue
-            details = extract_notification_details(value)
-            condition = f" / {value_row['condition']}" if value_row.get("condition") else ""
-            group = f" / Group {group_name}" if group_name else ""
-            lines.append(f"{key}{group} | {value_row['source']}{condition} | {details}")
-    if not lines:
-        return "No daily notification Remote Config parameter found. Add exact keys in Apps Config column J."
-    return lines_to_cell(lines, 30)
-
-
-def get_remote_config_static_summaries(app: AppConfig) -> dict:
+def get_remote_config_ab_rows(app: AppConfig) -> dict:
     empty = {
-        "remote_config_static": "Missing Firebase Project ID in Apps Config.",
         "time_capping_rows": [
             {
                 "name": app.time_capping_parameter or config.time_capping_parameter,
@@ -1261,7 +1053,6 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
                 "last_published": "",
             }
         ],
-        "daily_notifications_static": "Missing Firebase Project ID in Apps Config.",
     }
     if not app.firebase_project_id:
         return empty
@@ -1269,10 +1060,7 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
     try:
         template = get_firebase_remote_config_template(app.firebase_project_id)
         version = template.get("version", {}) or {}
-        version_number = version.get("versionNumber", "")
-        update_time = version.get("updateTime", "")
         last_published = format_last_published(version)
-        total_parameters = sum(1 for _ in iter_remote_config_parameters(template))
         condition_map = get_remote_config_condition_map(template)
 
         time_key = app.time_capping_parameter or config.time_capping_parameter
@@ -1312,26 +1100,15 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
                     )
                 )
 
-        daily_notifications = summarize_daily_notifications_from_template(app, template)
-        remote_config_static = lines_to_cell(
-            [
-                f"Template Version: {version_number}" if version_number else "Template Version: blank",
-                f"Last Published At: {update_time}" if update_time else "Last Published At: blank",
-                f"Total Parameters: {total_parameters}",
-            ]
-        )
         return {
-            "remote_config_static": remote_config_static,
             "time_capping_rows": time_capping_rows,
             "iap_screen_rows": iap_screen_rows,
-            "daily_notifications_static": daily_notifications,
         }
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"FIREBASE REMOTE CONFIG {status} for {app.app_name}: {error_text}")
         message = f"{status}: {error_text}"
         return {
-            "remote_config_static": message,
             "time_capping_rows": [
                 {
                     "name": app.time_capping_parameter or config.time_capping_parameter,
@@ -1350,281 +1127,8 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
                     "last_published": "",
                 }
             ],
-            "daily_notifications_static": message,
         }
 
-
-
-# =========================
-# FCM NOTIFICATION DELIVERY
-# =========================
-
-
-def get_notification_api_session():
-    global notification_api_session
-    if notification_api_session is None:
-        notification_api_session = AuthorizedSession(credentials)
-    return notification_api_session
-
-
-def format_fcm_date(date_data: dict) -> str:
-    year = int(date_data.get("year", 0) or 0)
-    month = int(date_data.get("month", 0) or 0)
-    day = int(date_data.get("day", 0) or 0)
-    if year and month and day:
-        return f"{year:04d}-{month:02d}-{day:02d}"
-    return json.dumps(date_data, ensure_ascii=False)
-
-
-def get_percent(data: dict, key: str) -> str:
-    value = data.get(key, "") if data else ""
-    if value in [None, ""]:
-        return ""
-    try:
-        return f"{round(float(value), 2)}%"
-    except Exception:
-        return str(value)
-
-
-def looks_like_firebase_app_id(value: str) -> bool:
-    value = str(value or "").strip()
-    return re.match(r"^1:\d+:(android|ios|web):", value) is not None
-
-
-def list_firebase_android_apps(project_identifier: str) -> list[dict]:
-    project_identifier = str(project_identifier or "").strip()
-    if not project_identifier:
-        return []
-    if project_identifier in firebase_android_apps_cache:
-        return firebase_android_apps_cache[project_identifier]
-
-    apps = []
-    page_token = ""
-    while True:
-        parent = f"projects/{quote(project_identifier, safe='-')}"
-        url = f"{config.firebase_management_api_base}/{parent}/androidApps"
-        params = {"pageSize": 100}
-        if page_token:
-            params["pageToken"] = page_token
-        response = get_notification_api_session().get(
-            url,
-            params=params,
-            timeout=config.firebase_remote_config_timeout,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Firebase Management API error {response.status_code}: {response.text}")
-        payload = response.json()
-        apps.extend(payload.get("apps", []) or [])
-        page_token = payload.get("nextPageToken", "")
-        if not page_token:
-            break
-    firebase_android_apps_cache[project_identifier] = apps
-    return apps
-
-
-def choose_firebase_android_app(app: AppConfig, apps: list[dict]) -> dict | None:
-    if not apps:
-        return None
-    wanted = str(app.firebase_app_id or "").strip().lower()
-    app_name = str(app.app_name or "").strip().lower()
-
-    if wanted:
-        for item in apps:
-            if str(item.get("appId", "")).lower() == wanted:
-                return item
-        for item in apps:
-            if str(item.get("packageName", "")).lower() == wanted:
-                return item
-
-    if app_name:
-        for item in apps:
-            display = str(item.get("displayName", "")).strip().lower()
-            package = str(item.get("packageName", "")).strip().lower()
-            if display and (display in app_name or app_name in display):
-                return item
-            if package and (package in app_name or app_name in package):
-                return item
-
-    if len(apps) == 1:
-        return apps[0]
-    return None
-
-
-def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
-    project_identifier = str(app.firebase_project_id or "").strip()
-    configured_app_id = str(app.firebase_app_id or "").strip()
-
-    if not project_identifier:
-        raise ValueError("Firebase Project ID is empty in Apps Config.")
-
-    if not configured_app_id:
-        android_apps = list_firebase_android_apps(project_identifier)
-        selected = choose_firebase_android_app(app, android_apps)
-        if selected:
-            return (
-                selected.get("projectId") or project_identifier,
-                selected.get("appId", ""),
-                "Firebase App ID was empty; auto-resolved from Firebase Android apps list.",
-            )
-        raise ValueError("Firebase App ID is empty in Apps Config and could not be auto-resolved from Firebase Android apps.")
-
-    if looks_like_firebase_app_id(configured_app_id):
-        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
-
-    android_apps = list_firebase_android_apps(project_identifier)
-    selected = choose_firebase_android_app(app, android_apps)
-    if selected:
-        return (
-            selected.get("projectId") or project_identifier,
-            selected.get("appId", ""),
-            f"Firebase App ID auto-resolved from Apps Config value '{configured_app_id}'.",
-        )
-
-    raise ValueError(
-        "Invalid Firebase App ID. Apps Config Firebase App ID should be Android Firebase App ID like "
-        "1:1234567890:android:abcdef, or a package name that can be resolved from Firebase Management API."
-    )
-
-
-def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool = False) -> dict:
-    project_part = quote(str(project_id).strip(), safe="-")
-    app_safe = "" if encode_colons else ":"
-    app_part = quote(str(app_id).strip(), safe=app_safe)
-    parent = f"projects/{project_part}/androidApps/{app_part}"
-    url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
-    response = get_notification_api_session().get(
-        url,
-        params={"pageSize": config.fcm_data_page_size},
-        timeout=config.firebase_remote_config_timeout,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"FCM Data API error {response.status_code}: {response.text}")
-    return response.json()
-
-
-def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
-    project_id, app_id, resolution_note = resolve_fcm_project_and_app_id(app)
-    cache_key = (project_id, app_id)
-    if cache_key in fcm_delivery_cache:
-        cached_payload = dict(fcm_delivery_cache[cache_key])
-        cached_payload["_resolution_note"] = resolution_note + " Reused cached FCM delivery response."
-        return cached_payload
-
-    try:
-        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=False)
-        payload["_resolution_note"] = resolution_note
-        payload["_resolved_project_id"] = project_id
-        payload["_resolved_app_id"] = app_id
-        fcm_delivery_cache[cache_key] = dict(payload)
-        return payload
-    except RuntimeError as error:
-        error_text = str(error)
-        if "400" in error_text or "INVALID_ARGUMENT" in error_text:
-            try:
-                payload = request_fcm_delivery_data(project_id, app_id, encode_colons=True)
-                payload["_resolution_note"] = resolution_note + " Retried with encoded Firebase App ID."
-                payload["_resolved_project_id"] = project_id
-                payload["_resolved_app_id"] = app_id
-                fcm_delivery_cache[cache_key] = dict(payload)
-                return payload
-            except RuntimeError:
-                pass
-
-        try:
-            android_apps = list_firebase_android_apps(app.firebase_project_id)
-            selected = choose_firebase_android_app(app, android_apps)
-            if selected:
-                normalized_project_id = selected.get("projectId") or project_id
-                normalized_app_id = selected.get("appId") or app_id
-                payload = request_fcm_delivery_data(normalized_project_id, normalized_app_id, encode_colons=False)
-                payload["_resolution_note"] = "Retried after resolving app through Firebase Management API."
-                payload["_resolved_project_id"] = normalized_project_id
-                payload["_resolved_app_id"] = normalized_app_id
-                fcm_delivery_cache[(normalized_project_id, normalized_app_id)] = dict(payload)
-                fcm_delivery_cache[cache_key] = dict(payload)
-                return payload
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            error_text
-            + " | Check Apps Config: Firebase Project ID should be the real Firebase project ID, "
-            "and Firebase App ID should be the Android appId from Firebase project settings."
-        )
-
-
-def fcm_delivery_to_lines(delivery: dict) -> list[str]:
-    data = delivery.get("data", {}) or {}
-    outcome = data.get("messageOutcomePercents", {}) or {}
-    performance = data.get("deliveryPerformancePercents", {}) or {}
-    insight = data.get("messageInsightPercents", {}) or {}
-    proxy = data.get("proxyNotificationInsightPercents", {}) or {}
-    label = delivery.get("analyticsLabel", "") or "(no analytics label)"
-
-    return [
-        f"Analytics Label: {label}",
-        f"Messages Accepted: {data.get('countMessagesAccepted', '')}",
-        f"Notifications Accepted: {data.get('countNotificationsAccepted', '')}",
-        f"Delivered: {get_percent(outcome, 'delivered')}",
-        f"Pending: {get_percent(outcome, 'pending')}",
-        f"Collapsed: {get_percent(outcome, 'collapsed')}",
-        f"Dropped - Too Many Pending: {get_percent(outcome, 'droppedTooManyPendingMessages')}",
-        f"Dropped - App Force Stopped: {get_percent(outcome, 'droppedAppForceStopped')}",
-        f"Dropped - Device Inactive: {get_percent(outcome, 'droppedDeviceInactive')}",
-        f"Dropped - TTL Expired: {get_percent(outcome, 'droppedTtlExpired')}",
-        f"Delivered No Delay: {get_percent(performance, 'deliveredNoDelay')}",
-        f"Delayed - Device Offline: {get_percent(performance, 'delayedDeviceOffline')}",
-        f"Delayed - Device Doze: {get_percent(performance, 'delayedDeviceDoze')}",
-        f"Delayed - Message Throttled: {get_percent(performance, 'delayedMessageThrottled')}",
-        f"Priority Lowered: {get_percent(insight, 'priorityLowered')}",
-        f"Proxied: {get_percent(proxy, 'proxied')}",
-    ]
-
-
-def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
-    """Return one FCM delivery record per date without creating another sheet.
-
-    If the API returns multiple analytics labels for a date, the unlabelled
-    aggregate is preferred because it matches the existing report. Otherwise,
-    the first returned label is used.
-    """
-    result: dict[str, dict] = {report_date: {} for report_date in report_dates}
-    try:
-        response = get_fcm_delivery_data_for_app(app)
-        delivery_rows = response.get("androidDeliveryData", []) or []
-        grouped: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-        for delivery in delivery_rows:
-            delivery_date = format_fcm_date(delivery.get("date", {}) or {})
-            if delivery_date in grouped:
-                grouped[delivery_date].append(delivery)
-
-        for report_date, items in grouped.items():
-            if not items:
-                continue
-            selected = next(
-                (item for item in items if not str(item.get("analyticsLabel", "") or "").strip()),
-                items[0],
-            )
-            data = selected.get("data", {}) or {}
-            outcome = data.get("messageOutcomePercents", {}) or {}
-            performance = data.get("deliveryPerformancePercents", {}) or {}
-            label = selected.get("analyticsLabel", "") or "(no analytics label)"
-            result[report_date] = {
-                "firebase_analytics_label": label,
-                "firebase_messages_accepted": to_number(data.get("countMessagesAccepted", 0)),
-                "firebase_notifications_accepted": to_number(data.get("countNotificationsAccepted", 0)),
-                "firebase_delivered": get_percent(outcome, "delivered"),
-                "firebase_pending": get_percent(outcome, "pending"),
-                "firebase_dropped_app_force_stopped": get_percent(outcome, "droppedAppForceStopped"),
-                "firebase_dropped_device_inactive": get_percent(outcome, "droppedDeviceInactive"),
-                "firebase_delivered_no_delay": get_percent(performance, "deliveredNoDelay"),
-                "firebase_delayed_device_offline": get_percent(performance, "delayedDeviceOffline"),
-            }
-        return result
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
-        return result
 
 
 def get_event_metric(event_data: dict, report_date: str, event_name: str) -> dict:
@@ -1660,25 +1164,6 @@ def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict
         f"eventName = screen_view AND {app.screen_field} contains {app.home_screen_name}",
     )
 
-NOTIFICATION_COLUMNS = [
-    "notification_receive",
-    "notification_foreground",
-    "notification_open",
-    "notification_dismiss",
-]
-
-FCM_COLUMNS = [
-    "firebase_analytics_label",
-    "firebase_messages_accepted",
-    "firebase_notifications_accepted",
-    "firebase_delivered",
-    "firebase_pending",
-    "firebase_dropped_app_force_stopped",
-    "firebase_dropped_device_inactive",
-    "firebase_delivered_no_delay",
-    "firebase_delayed_device_offline",
-]
-
 AUDIENCE_SEGMENTS = [
     ("All Users", "all_users"),
     ("US Users", "us_users"),
@@ -1686,14 +1171,6 @@ AUDIENCE_SEGMENTS = [
     ("Paid Traffic", "paid_traffic"),
     ("Mobile Traffic", "mobile_traffic"),
     ("Tablet Traffic", "tablet_traffic"),
-]
-
-REMOTE_EVENT_COLUMNS = [
-    "dn_rc_inter_clicked",
-    "dn_rc_inter_displayed",
-    "dn_rc_inter_loaded",
-    "dn_rc_inter_requested",
-    "dn_rc_inter_dismissed",
 ]
 
 PERSONALIZED_COLUMN_SPECS = [
@@ -1706,22 +1183,24 @@ PERSONALIZED_COLUMN_SPECS = [
     ("Top Screens / Screen Class", "screen_class"),
 ]
 
+# These events backed removed output columns and must not be included in the
+# shared GA4 event report, even when they are accidentally listed as feature
+# events in an existing Apps Config row or repository variable.
+EXCLUDED_GA4_EVENT_NAMES = {
+    "notification_receive",
+    "notification_foreground",
+    "notification_open",
+    "notification_dismiss",
+    "dn_rc_inter_clicked",
+    "dn_rc_inter_displayed",
+    "dn_rc_inter_loaded",
+    "dn_rc_inter_requested",
+    "dn_rc_inter_dismissed",
+}
+
 
 def build_output_headers() -> list[str]:
     headers = ["Package Name", "Date"]
-
-    # GA4 notification events are split into numeric Events and Users columns.
-    for event_name in NOTIFICATION_COLUMNS:
-        headers.extend(
-            [
-                f"{event_name}_Events",
-                f"{event_name}_USERS",
-            ]
-        )
-
-    # Firebase delivery, audience, funnel, A/B, time analysis, and retention
-    # columns retain their previously approved names.
-    headers.extend(FCM_COLUMNS)
 
     for _, slug in AUDIENCE_SEGMENTS:
         headers.extend(
@@ -1744,27 +1223,11 @@ def build_output_headers() -> list[str]:
             "funnel_ad_impression/users",
             "funnel_in_app_purchase/events",
             "funnel_in_app_purchase/users",
-            "remote_template_version",
-            "remote_last_published_at",
-            "remote_total_parameters",
         ]
     )
 
-    for event_name in REMOTE_EVENT_COLUMNS:
-        headers.extend(
-            [
-                f"remote_{event_name}/users",
-                f"remote_{event_name}/events",
-            ]
-        )
-
-    # App-version values are row keys, not rank-specific columns.
     headers.extend(
         [
-            "remote_app_version",
-            "remote_app_version_users",
-            "remote_app_version_sessions",
-            "remote_app_version_er",
             "time_capping_name",
             "time_capping_condition",
             "time_capping_value",
@@ -1814,24 +1277,6 @@ def build_output_headers() -> list[str]:
 OUTPUT_HEADERS = build_output_headers()
 
 
-def parse_remote_static_fields(static_summary: str) -> dict[str, object]:
-    fields: dict[str, object] = {
-        "remote_template_version": "",
-        "remote_last_published_at": "",
-        "remote_total_parameters": "",
-    }
-    for raw_line in str(static_summary or "").splitlines():
-        line = raw_line.strip()
-        if line.startswith("Template Version:"):
-            fields["remote_template_version"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Last Published At:"):
-            fields["remote_last_published_at"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Total Parameters:"):
-            value = line.split(":", 1)[1].strip()
-            fields["remote_total_parameters"] = to_number(value)
-    return fields
-
-
 def set_audience_columns(row: dict, segments: list[dict]):
     segment_map = {item.get("segment", ""): item for item in segments}
     for segment_name, slug in AUDIENCE_SEGMENTS:
@@ -1878,31 +1323,6 @@ def set_funnel_columns(
         row[f"funnel_{event_name}/users"] = to_number(data.get("active_users", 0))
 
 
-def set_remote_columns(
-    row: dict,
-    remote_static: str,
-    remote_events: dict[str, dict],
-):
-    """Set Remote Config template and GA4 event fields.
-
-    App-version performance is intentionally handled in separate keyed rows so
-    the same version never moves between rank-based columns across dates.
-    """
-    row.update(parse_remote_static_fields(remote_static))
-
-    for event_name in REMOTE_EVENT_COLUMNS:
-        data = remote_events.get(event_name, {})
-        row[f"remote_{event_name}/users"] = data.get("users", 0)
-        row[f"remote_{event_name}/events"] = data.get("events", 0)
-
-
-def set_remote_version_columns(row: dict, item: dict):
-    row["remote_app_version"] = item.get("version", "")
-    row["remote_app_version_users"] = item.get("users", "")
-    row["remote_app_version_sessions"] = item.get("sessions", "")
-    row["remote_app_version_er"] = item.get("er", "")
-
-
 def set_ab_parameter_columns(row: dict, prefix: str, item: dict):
     row[f"{prefix}_name"] = item.get("name", "")
     row[f"{prefix}_condition"] = item.get("condition", "")
@@ -1946,20 +1366,22 @@ def set_personalized_columns(row: dict, slug: str, item: dict):
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
     print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
 
-    notification_events = list(NOTIFICATION_COLUMNS)
     feature_events = split_csv(app.feature_event_names)
     app_open_events = split_csv(app.app_open_event_names)
     home_event_names = split_csv(app.home_event_names)
     required_funnel_events = ["ad_impression", "in_app_purchase"]
-    event_names = split_csv(
-        ",".join(
-            notification_events
-            + feature_events
-            + required_funnel_events
-            + app_open_events
-            + home_event_names
+    event_names = [
+        event_name
+        for event_name in split_csv(
+            ",".join(
+                feature_events
+                + required_funnel_events
+                + app_open_events
+                + home_event_names
+            )
         )
-    )
+        if event_name.lower() not in EXCLUDED_GA4_EVENT_NAMES
+    ]
 
     daily_metrics: dict[str, dict] = {}
     event_data: dict[tuple[str, str], dict] = {}
@@ -1967,10 +1389,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     retention_data: dict[str, dict] = {}
     audience_segments = {report_date: [] for report_date in report_dates}
     personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
-    remote_events: dict[str, dict[str, dict]] = {report_date: {} for report_date in report_dates}
-    remote_versions: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
-    static_remote = get_remote_config_static_summaries(app)
+    remote_ab = get_remote_config_ab_rows(app)
 
     try:
         daily_metrics = run_daily_metrics_report(app)
@@ -2003,40 +1422,21 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"PERSONALIZED UX {status} for {app.app_name}: {error_text}")
-    try:
-        remote_events = run_remote_config_events_report(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"REMOTE CONFIG EVENTS {status} for {app.app_name}: {error_text}")
-    try:
-        remote_versions = run_remote_config_app_versions(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"REMOTE CONFIG APP VERSIONS {status} for {app.app_name}: {error_text}")
-    try:
-        fcm_delivery = build_fcm_delivery_fields_by_date(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
-
     rows: list[list] = []
     for report_date in report_dates:
-        # Remote app versions and every Personalized UX category are
-        # independent datasets. They are compacted side by side by row index
-        # so Country, Language, Device Category, Operating System, App Version,
-        # First User Medium, and Screen Class each use their own column group
-        # without creating stacked category blocks or artificial gaps.
+        # Personalized UX categories are independent datasets. They are
+        # compacted side by side by row index so every category uses its own
+        # column group without creating stacked blocks or artificial gaps.
         personalized_for_date = personalized_ux.get(report_date, {})
         personalized_groups: dict[str, list[dict]] = {
             slug: personalized_for_date.get(category, [])
             for category, slug in PERSONALIZED_COLUMN_SPECS
         }
 
-        version_items = remote_versions.get(report_date, [])
-        time_capping_items = static_remote.get("time_capping_rows", []) or []
-        iap_screen_items = static_remote.get("iap_screen_rows", []) or []
+        time_capping_items = remote_ab.get("time_capping_rows", []) or []
+        iap_screen_items = remote_ab.get("iap_screen_rows", []) or []
         row_count = max(
-            [1, len(version_items), len(time_capping_items), len(iap_screen_items)]
+            [1, len(time_capping_items), len(iap_screen_items)]
             + [len(items) for items in personalized_groups.values()]
         )
 
@@ -2048,28 +1448,13 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             # Store date-level summary metrics only once, on the first compact
             # row for this package and date.
             if index == 0:
-                for event_name in NOTIFICATION_COLUMNS:
-                    data = get_event_metric(event_data, report_date, event_name)
-                    output_row[f"{event_name}_Events"] = to_number(data.get("event_count", 0))
-                    output_row[f"{event_name}_USERS"] = to_number(data.get("active_users", 0))
-
-                output_row.update(fcm_delivery.get(report_date, {}))
                 set_audience_columns(output_row, audience_segments.get(report_date, []))
                 set_funnel_columns(output_row, report_date, app, event_data, home_data)
-                set_remote_columns(
-                    output_row,
-                    static_remote.get("remote_config_static", ""),
-                    remote_events.get(report_date, {}),
-                )
                 set_time_and_retention_columns(
                     output_row,
                     daily_metrics.get(report_date, {}),
                     retention_data.get(report_date, {}),
                 )
-
-            # Fill the next Remote Config app-version record, when available.
-            if index < len(version_items):
-                set_remote_version_columns(output_row, version_items[index])
 
             # Time Capping and IAP parameter records are independent lists.
             # They are aligned side by side by row index only to avoid gaps.
