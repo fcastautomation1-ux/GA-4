@@ -1,9 +1,7 @@
 name: GA4 to Google Sheets
 
 on:
-  workflow_dispatch
-
-  
+  workflow_dispatch:
 
 jobs:
   ga4-to-sheets:
