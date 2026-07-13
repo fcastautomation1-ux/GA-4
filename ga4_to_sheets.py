@@ -1435,14 +1435,39 @@ def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool 
     app_part = quote(str(app_id).strip(), safe=app_safe)
     parent = f"projects/{project_part}/androidApps/{app_part}"
     url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
-    response = get_notification_api_session().get(
-        url,
-        params={"pageSize": config.fcm_data_page_size},
-        timeout=config.firebase_remote_config_timeout,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"FCM Data API error {response.status_code}: {response.text}")
-    return response.json()
+
+    delivery_rows: list[dict] = []
+    page_token = ""
+    seen_page_tokens: set[str] = set()
+
+    while True:
+        params = {"pageSize": config.fcm_data_page_size}
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = get_notification_api_session().get(
+            url,
+            params=params,
+            timeout=config.firebase_remote_config_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"FCM Data API error {response.status_code}: {response.text}"
+            )
+
+        payload = response.json()
+        delivery_rows.extend(payload.get("androidDeliveryData", []) or [])
+
+        next_page_token = str(payload.get("nextPageToken", "") or "")
+        if not next_page_token:
+            break
+        if next_page_token in seen_page_tokens:
+            raise RuntimeError("FCM Data API returned a repeated nextPageToken.")
+
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
+
+    return {"androidDeliveryData": delivery_rows}
 
 
 def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
@@ -1468,7 +1493,7 @@ def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
 
 
 def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
-    """Return only the three retained FCM values for each requested date."""
+    """Return date-level FCM totals across every analytics-label row."""
     result: dict[str, dict] = {report_date: {} for report_date in report_dates}
     try:
         response = get_fcm_delivery_data_for_app(app)
@@ -1484,20 +1509,47 @@ def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -
             if not items:
                 continue
 
-            # Prefer the unlabelled aggregate. It represents the date-level
-            # total and avoids duplicating one row for each analytics label.
-            selected = next(
-                (item for item in items if not str(item.get("analyticsLabel", "") or "").strip()),
-                items[0],
-            )
-            data = selected.get("data", {}) or {}
-            outcome = data.get("messageOutcomePercents", {}) or {}
+            total_messages_accepted = 0.0
+            delivered_weighted_total = 0.0
+            pending_weighted_total = 0.0
+
+            for item in items:
+                data = item.get("data", {}) or {}
+                messages_accepted = max(
+                    0.0,
+                    to_float(data.get("countMessagesAccepted", 0)),
+                )
+                if messages_accepted == 0:
+                    continue
+
+                outcome = data.get("messageOutcomePercents", {}) or {}
+                total_messages_accepted += messages_accepted
+                delivered_weighted_total += messages_accepted * to_float(
+                    outcome.get("delivered", 0)
+                )
+                pending_weighted_total += messages_accepted * to_float(
+                    outcome.get("pending", 0)
+                )
+
+            if total_messages_accepted == 0:
+                continue
+
+            delivered_percent = delivered_weighted_total / total_messages_accepted
+            pending_percent = pending_weighted_total / total_messages_accepted
+
             result[report_date] = {
-                "firebase_notifications_accepted": to_number(
-                    data.get("countNotificationsAccepted", 0)
+                # Keep the existing column name for spreadsheet compatibility.
+                # Its value now uses the same countMessagesAccepted denominator
+                # as the delivered and pending percentages.
+                "firebase_notifications_accepted": to_number(total_messages_accepted),
+                "firebase_delivered": get_percent(
+                    {"value": delivered_percent},
+                    "value",
                 ),
-                "firebase_delivered": get_percent(outcome, "delivered"),
-                "firebase_pending": get_percent(outcome, "pending"),
+                "firebase_pending": get_percent(
+                    {"value": pending_percent},
+                    "value",
+                ),
             }
 
         return result
