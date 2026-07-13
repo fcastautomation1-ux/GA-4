@@ -3,9 +3,6 @@ name: GA4 to Google Sheets
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "0 4 * * *"
-
 jobs:
   ga4-to-sheets:
     runs-on: ubuntu-latest
@@ -27,18 +24,38 @@ jobs:
           GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-          START_DATE: ${{ vars.START_DATE || '28daysAgo' }}
-          END_DATE: ${{ vars.END_DATE || 'yesterday' }}
-          RETENTION_DAYS: ${{ vars.RETENTION_DAYS || '7' }}
+          START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
+          END_DATE: ${{ vars.END_DATE || 'today' }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
 
-          APPS_CONFIG_SHEET: Apps Config
-          SUMMARY_SHEET: GA4 Funnel Summary
-          DETAILS_SHEET: GA4 Funnel Details
-          USER_SESSION_SHEET: GA4 User Session Summary
-          RETENTION_DETAILS_SHEET: GA4 Retention Details
+          APPS_CONFIG_SHEET: ${{ vars.APPS_CONFIG_SHEET || 'Apps Config' }}
+          MERGED_SHEET: ${{ vars.MERGED_SHEET || 'GA4 Merged Data' }}
 
-          DEFAULT_HOME_SCREEN_NAME: MainActivity
-          DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
-          TIMEZONE: Asia/Karachi
+          DEFAULT_HOME_SCREEN_NAME: ${{ vars.DEFAULT_HOME_SCREEN_NAME || 'MainActivity' }}
+          DEFAULT_SCREEN_FIELD: ${{ vars.DEFAULT_SCREEN_FIELD || 'unifiedPagePathScreen' }}
+
+          KEY_EVENT_NAMES: ${{ vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
+          APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
+          HOME_EVENT_NAMES: ${{ vars.HOME_EVENT_NAMES || '' }}
+          FEATURE_EVENT_NAMES: ${{ vars.FEATURE_EVENT_NAMES || vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
+
+          PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
+
+          TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
+          IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
+          IAP_SCREEN_PARAMETER_KEYWORDS: ${{ vars.IAP_SCREEN_PARAMETER_KEYWORDS || 'iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen' }}
+          REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
+          FIREBASE_REMOTE_CONFIG_API_BASE: ${{ vars.FIREBASE_REMOTE_CONFIG_API_BASE || 'https://firebaseremoteconfig.googleapis.com/v1' }}
+          FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
+
+          # Required only for the three retained FCM delivery columns.
+          FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
+          FIREBASE_MANAGEMENT_API_BASE: ${{ vars.FIREBASE_MANAGEMENT_API_BASE || 'https://firebase.googleapis.com/v1beta1' }}
+          FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
+
+          FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
+          CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
+          GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
+          GA4_ADMIN_AUDIENCE_API_BASE: ${{ vars.GA4_ADMIN_AUDIENCE_API_BASE || 'https://analyticsadmin.googleapis.com/v1alpha' }}
 
         run: python ga4_to_sheets.py
