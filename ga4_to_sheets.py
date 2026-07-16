@@ -33,8 +33,6 @@ config = load_config()
 class AppConfig:
     app_name: str
     property_id: str
-    home_screen_name: str
-    screen_field: str
     firebase_project_id: str
     firebase_project_name: str
     firebase_app_id: str
@@ -45,6 +43,9 @@ class AppConfig:
     feature_event_names: str
     ga4_stream_id: str = ""
     package_name: str = ""
+    home_screen_name: str = ""
+    screen_field: str = ""
+    home_detection_method: str = ""
 
 
 def get_credentials():
@@ -118,7 +119,7 @@ def cleanup_old_report_sheets(service):
         spreadsheetId=config.spreadsheet_id,
         fields="sheets.properties(sheetId,title)",
     ).execute()
-    protected = {config.apps_config_sheet, config.merged_sheet}
+    protected = {config.merged_sheet}
     requests = []
     names = []
     for sheet in spreadsheet.get("sheets", []):
@@ -150,92 +151,6 @@ def write_sheet(sheet_name: str, rows: list[list]):
         valueInputOption="USER_ENTERED",
         body={"values": sanitize_rows_for_google_sheets(rows)},
     ).execute()
-
-
-def get_apps_config_headers() -> list[str]:
-    return [
-        "Enabled",
-        "App Name",
-        "Property ID",
-        "Home Screen Name",
-        "Screen Field",
-        "Firebase Project ID",
-        "Firebase Project Name",
-        "Firebase App ID",
-        "Time Capping Parameter",
-        "Daily Notification Parameters",
-        "IAP Screen Parameter",
-        "App Open Event Names",
-        "Home Event Names",
-        "Feature Event Names",
-    ]
-
-
-def ensure_apps_config_headers(service, values: list[list]):
-    expected_headers = get_apps_config_headers()
-    current_headers = values[0] if values else []
-    if current_headers[: len(expected_headers)] == expected_headers:
-        return
-    service.spreadsheets().values().update(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": [expected_headers]},
-    ).execute()
-
-
-def create_apps_config_template(service):
-    ensure_sheet_exists(service, config.apps_config_sheet)
-    service.spreadsheets().values().update(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": [get_apps_config_headers()]},
-    ).execute()
-
-
-def read_apps_config() -> list[AppConfig]:
-    service = get_sheets_service()
-    ensure_sheet_exists(service, config.apps_config_sheet)
-    response = service.spreadsheets().values().get(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A:N",
-    ).execute()
-    values = response.get("values", [])
-    if len(values) <= 1:
-        create_apps_config_template(service)
-        raise SystemExit("Apps Config sheet was empty. Template created. Fill apps and run again.")
-    ensure_apps_config_headers(service, values)
-
-    apps: list[AppConfig] = []
-    for index, row in enumerate(values[1:], start=2):
-        enabled = row[0].strip().upper() if len(row) > 0 else ""
-        app_name = row[1].strip() if len(row) > 1 else ""
-        property_id = row[2].strip() if len(row) > 2 else ""
-        if enabled not in {"TRUE", "YES", "1", "Y"}:
-            continue
-        if not app_name or not property_id:
-            print(f"Skipping row {index}: App Name or Property ID is missing.")
-            continue
-        apps.append(
-            AppConfig(
-                app_name=app_name,
-                property_id=property_id,
-                home_screen_name=(row[3].strip() if len(row) > 3 and row[3].strip() else config.default_home_screen_name),
-                screen_field=(row[4].strip() if len(row) > 4 and row[4].strip() else config.default_screen_field),
-                firebase_project_id=(row[5].strip() if len(row) > 5 else ""),
-                firebase_project_name=(row[6].strip() if len(row) > 6 else ""),
-                firebase_app_id=(row[7].strip() if len(row) > 7 else ""),
-                time_capping_parameter=(row[8].strip() if len(row) > 8 else ""),
-                iap_screen_parameter=(row[10].strip() if len(row) > 10 else ""),
-                app_open_event_names=(row[11].strip() if len(row) > 11 and row[11].strip() else config.app_open_event_names),
-                home_event_names=(row[12].strip() if len(row) > 12 else ""),
-                feature_event_names=(row[13].strip() if len(row) > 13 and row[13].strip() else config.feature_event_names),
-            )
-        )
-    if not apps:
-        raise SystemExit("No enabled apps found in Apps Config sheet.")
-    return apps
 
 
 def list_accessible_ga4_property_summaries() -> list[dict]:
@@ -453,28 +368,14 @@ def discover_apps_from_service_account() -> list[AppConfig]:
                 AppConfig(
                     app_name=app_name,
                     property_id=property_id,
-                    home_screen_name=str(
-                        getattr(config, "default_home_screen_name", "Home")
-                    ),
-                    screen_field=str(
-                        getattr(config, "default_screen_field", "unifiedScreenName")
-                    ),
                     firebase_project_id=firebase_project_id,
                     firebase_project_name=firebase_project_name,
                     firebase_app_id=firebase_app_id,
-                    time_capping_parameter=str(
-                        getattr(config, "time_capping_parameter", "")
-                    ),
-                    iap_screen_parameter=str(
-                        getattr(config, "iap_screen_parameter", "")
-                    ),
-                    app_open_event_names=str(
-                        getattr(config, "app_open_event_names", "app_open")
-                    ),
-                    home_event_names="",
-                    feature_event_names=str(
-                        getattr(config, "feature_event_names", "")
-                    ),
+                    time_capping_parameter=config.time_capping_parameter,
+                    iap_screen_parameter=config.iap_screen_parameter,
+                    app_open_event_names=config.app_open_event_names,
+                    home_event_names=config.home_event_names,
+                    feature_event_names=config.feature_event_names,
                     ga4_stream_id=stream_id,
                     package_name=package_name,
                 )
@@ -713,6 +614,225 @@ def report_dimension_filter_kwargs(
     return {"dimension_filter": expression}
 
 
+HOME_SCREEN_DIMENSIONS = (
+    "unifiedScreenName",
+    "unifiedScreenClass",
+    "unifiedPagePathScreen",
+)
+
+HOME_SCREEN_POSITIVE_TERMS = (
+    "home",
+    "main",
+    "dashboard",
+    "landing",
+    "launcher",
+    "feed",
+)
+
+HOME_SCREEN_TRANSIENT_TERMS = (
+    "splash",
+    "intro",
+    "onboard",
+    "tutorial",
+    "permission",
+    "consent",
+    "language",
+    "login",
+    "signin",
+    "sign_in",
+    "register",
+    "paywall",
+    "premium",
+    "purchase",
+    "subscription",
+    "subscribe",
+    "offer",
+    "interstitial",
+    "rewarded",
+    "adactivity",
+    "ad_activity",
+)
+
+
+def _valid_screen_value(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text and text.lower() not in {"(not set)", "not set", "unknown", "null"})
+
+
+def _home_screen_score(value: str, active_users, views, rank: int) -> float:
+    """Score a screen as the likely post-launch home destination.
+
+    Usage remains the main signal. Name-based terms only help avoid selecting
+    transient splash, onboarding, permission, ad, or paywall screens.
+    """
+    text = str(value or "").strip().lower()
+    score = to_float(active_users) * 1000.0 + to_float(views)
+    score -= rank * 0.01
+    if any(term in text for term in HOME_SCREEN_POSITIVE_TERMS):
+        score += max(to_float(active_users), 1.0) * 400.0
+    if any(term in text for term in HOME_SCREEN_TRANSIENT_TERMS):
+        score -= max(to_float(active_users), 1.0) * 700.0
+    return score
+
+
+def apply_home_screen_override(app: AppConfig) -> bool:
+    """Apply an optional per-app home-screen override from JSON config.
+
+    The JSON object can be keyed by package name, Firebase App ID, GA4 stream
+    ID, GA4 property ID, or discovered app name. Each value must contain
+    ``field`` and ``value``. Example::
+
+        {
+          "com.example.app": {
+            "field": "unifiedScreenName",
+            "value": "HomeScreen"
+          }
+        }
+    """
+    raw = str(config.home_screen_overrides_json or "{}").strip()
+    try:
+        overrides = json.loads(raw)
+    except json.JSONDecodeError as error:
+        print(f"Invalid HOME_SCREEN_OVERRIDES_JSON: {error}")
+        return False
+
+    if not isinstance(overrides, dict):
+        print("HOME_SCREEN_OVERRIDES_JSON must be a JSON object.")
+        return False
+
+    lookup_keys = [
+        app.package_name,
+        app.firebase_app_id,
+        app.ga4_stream_id,
+        app.property_id,
+        app.app_name,
+    ]
+    override = None
+    matched_key = ""
+    for key in lookup_keys:
+        key = str(key or "").strip()
+        if key and key in overrides:
+            override = overrides[key]
+            matched_key = key
+            break
+
+    if not isinstance(override, dict):
+        return False
+
+    field = str(override.get("field", "") or "").strip()
+    value = str(override.get("value", "") or "").strip()
+    if field not in HOME_SCREEN_DIMENSIONS or not _valid_screen_value(value):
+        print(
+            f"Ignoring invalid home-screen override for {matched_key}. "
+            f"field must be one of {HOME_SCREEN_DIMENSIONS} and value cannot be empty."
+        )
+        return False
+
+    app.screen_field = field
+    app.home_screen_name = value
+    app.home_detection_method = f"HOME_SCREEN_OVERRIDES_JSON override ({matched_key})"
+    print(
+        f"Applied home-screen override for {app.app_name}: "
+        f"{app.screen_field} = {app.home_screen_name}"
+    )
+    return True
+
+
+def discover_home_screen(app: AppConfig) -> tuple[str, str, str]:
+    """Detect the best available GA4 screen dimension and likely home screen.
+
+    No Activity name or screen field is hardcoded. The function queries valid
+    GA4 Data API screen dimensions, scopes the report to the discovered stream,
+    and picks the strongest non-transient screen. When a global HOME_EVENT_NAMES
+    override is configured, this function is not needed by the funnel.
+    """
+    candidates: list[dict] = []
+
+    for dimension_name in HOME_SCREEN_DIMENSIONS:
+        try:
+            request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=config.start_date,
+                        end_date=config.end_date,
+                    )
+                ],
+                dimensions=[Dimension(name=dimension_name)],
+                metrics=[Metric(name="activeUsers"), Metric(name="screenPageViews")],
+                **report_dimension_filter_kwargs(
+                    app,
+                    exact_filter("eventName", "screen_view"),
+                ),
+                order_bys=[metric_order("activeUsers"), metric_order("screenPageViews")],
+                keep_empty_rows=False,
+                limit=100,
+            )
+            response = beta_client.run_report(request)
+            rows = parse_response_rows(response)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(
+                f"HOME SCREEN DISCOVERY {dimension_name} {status} for "
+                f"{app.app_name}: {error_text}"
+            )
+            continue
+
+        dimension_candidates = []
+        for rank, row in enumerate(rows):
+            value = str(row.get(dimension_name, "") or "").strip()
+            if not _valid_screen_value(value):
+                continue
+            active_users = to_float(row.get("activeUsers", 0))
+            views = to_float(row.get("screenPageViews", 0))
+            dimension_candidates.append(
+                {
+                    "field": dimension_name,
+                    "value": value,
+                    "active_users": active_users,
+                    "views": views,
+                    "score": _home_screen_score(value, active_users, views, rank),
+                    "rank": rank,
+                }
+            )
+
+        if dimension_candidates:
+            candidates.extend(dimension_candidates)
+
+    if not candidates:
+        app.home_screen_name = ""
+        app.screen_field = ""
+        app.home_detection_method = "No screen_view data returned"
+        print(f"No home screen could be detected for {app.app_name}.")
+        return "", "", app.home_detection_method
+
+    # Prefer an explicit screen name when its usage is close to the best class;
+    # otherwise choose the highest scored valid candidate across all dimensions.
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            item["active_users"],
+            item["views"],
+            -HOME_SCREEN_DIMENSIONS.index(item["field"]),
+        ),
+        reverse=True,
+    )
+    selected = candidates[0]
+
+    app.home_screen_name = selected["value"]
+    app.screen_field = selected["field"]
+    app.home_detection_method = (
+        "Auto-detected from screen_view using activeUsers and screenPageViews"
+    )
+    print(
+        f"Detected home screen for {app.app_name}: "
+        f"{app.screen_field} = {app.home_screen_name} "
+        f"(active users={to_number(selected['active_users'])}, "
+        f"views={to_number(selected['views'])})"
+    )
+    return app.home_screen_name, app.screen_field, app.home_detection_method
+
+
 def date_order() -> OrderBy:
     return OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))
 
@@ -828,6 +948,9 @@ def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, 
 
 
 def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
+    if not app.screen_field or not app.home_screen_name:
+        return {}
+
     request = RunReportRequest(
         property=f"properties/{app.property_id}",
         date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
@@ -838,7 +961,7 @@ def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
             and_filter(
                 [
                     exact_filter("eventName", "screen_view"),
-                    contains_filter(app.screen_field, app.home_screen_name),
+                    exact_filter(app.screen_field, app.home_screen_name),
                 ]
             ),
         ),
@@ -1937,11 +2060,16 @@ def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict
         )
 
     screen_data = home_data.get(report_date, {})
+    detected_filter = (
+        f"eventName = screen_view AND {app.screen_field} = {app.home_screen_name}"
+        if app.screen_field and app.home_screen_name
+        else "No home event or detectable screen_view dimension"
+    )
     return (
-        "screen_view",
+        "screen_view" if app.home_screen_name else "",
         to_number(screen_data.get("active_users", 0)),
         to_number(screen_data.get("event_count", 0)),
-        f"eventName = screen_view AND {app.screen_field} contains {app.home_screen_name}",
+        detected_filter,
     )
 
 PERSONALIZED_COLUMN_SPECS = [
@@ -1986,6 +2114,9 @@ def build_output_headers() -> list[str]:
         "Firebase Project Name",
         "Firebase App ID",
         "Package Name",
+        "Detected Home Screen",
+        "Detected Screen Field",
+        "Home Detection Method",
         "Date",
     ]
     headers.extend(FCM_COLUMNS)
@@ -2182,6 +2313,13 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     audience_rows: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
     personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
     fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
+    # A configured home-event override is respected. Otherwise detect the
+    # screen field and home screen independently for every discovered app.
+    if home_event_names:
+        app.home_detection_method = "Configured HOME_EVENT_NAMES override"
+    elif not apply_home_screen_override(app):
+        discover_home_screen(app)
+
     remote_ab = get_remote_config_ab_rows(app)
 
     try:
@@ -2257,6 +2395,9 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             output_row["Firebase Project Name"] = app.firebase_project_name
             output_row["Firebase App ID"] = app.firebase_app_id
             output_row["Package Name"] = package_name
+            output_row["Detected Home Screen"] = app.home_screen_name
+            output_row["Detected Screen Field"] = app.screen_field
+            output_row["Home Detection Method"] = app.home_detection_method
             output_row["Date"] = report_date
 
             # Store date-level summary metrics only once, on the first compact
