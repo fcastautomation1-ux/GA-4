@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/firebase.remoteconfig",
     "https://www.googleapis.com/auth/cloud-platform",
 ]
@@ -43,9 +42,14 @@ def optional_bool_env(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Config:
-    spreadsheet_id: str
     service_account_json: str
-    merged_sheet: str
+
+    bigquery_project_id: str
+    bigquery_dataset: str
+    bigquery_table: str
+    bigquery_location: str
+    bigquery_write_disposition: str
+    bigquery_create_dataset: bool
 
     start_date: str
     end_date: str
@@ -71,14 +75,29 @@ class Config:
     fetch_package_name: bool
     ga4_admin_api_base: str
     ga4_admin_audience_api_base: str
-    cleanup_old_tabs: bool
 
 
 def load_config() -> Config:
     return Config(
-        spreadsheet_id=required_env("SPREADSHEET_ID"),
         service_account_json=required_env("GA4_SERVICE_ACCOUNT_JSON"),
-        merged_sheet=optional_env("MERGED_SHEET", "GA4 Merged Data"),
+
+        # If BIGQUERY_PROJECT_ID is empty, the project_id in the service-account
+        # JSON is used. Dataset and table IDs use Standard SQL-safe identifiers.
+        bigquery_project_id=optional_env("BIGQUERY_PROJECT_ID", ""),
+        bigquery_dataset=optional_env("BIGQUERY_DATASET", "ga4_reporting"),
+        bigquery_table=optional_env("BIGQUERY_TABLE", "ga4_merged_data"),
+        bigquery_location=optional_env("BIGQUERY_LOCATION", "US"),
+        # WRITE_TRUNCATE matches the former Google Sheets behavior: every run
+        # replaces the previous export. WRITE_APPEND and WRITE_EMPTY are also
+        # supported, but WRITE_APPEND can create duplicates across runs.
+        bigquery_write_disposition=optional_env(
+            "BIGQUERY_WRITE_DISPOSITION",
+            "WRITE_TRUNCATE",
+        ).upper(),
+        bigquery_create_dataset=optional_bool_env(
+            "BIGQUERY_CREATE_DATASET",
+            True,
+        ),
 
         start_date=optional_env("START_DATE", "7daysAgo"),
         end_date=optional_env("END_DATE", "today"),
@@ -88,12 +107,7 @@ def load_config() -> Config:
             "APP_OPEN_EVENT_NAMES",
             "session_start,app_open,first_open",
         ),
-        # Optional override. Leave empty to auto-detect the home screen for
-        # every app independently from screen_view data.
         home_event_names=optional_env("HOME_EVENT_NAMES", ""),
-        # Optional per-app fallback when automatic screen detection is not
-        # suitable. Keys may be package name, Firebase App ID, GA4 stream ID,
-        # GA4 property ID, or discovered app name.
         home_screen_overrides_json=optional_env(
             "HOME_SCREEN_OVERRIDES_JSON",
             "{}",
@@ -152,5 +166,4 @@ def load_config() -> Config:
             "GA4_ADMIN_AUDIENCE_API_BASE",
             "https://analyticsadmin.googleapis.com/v1alpha",
         ),
-        cleanup_old_tabs=optional_bool_env("CLEANUP_OLD_TABS", True),
     )
