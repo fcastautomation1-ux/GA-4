@@ -43,6 +43,8 @@ class AppConfig:
     app_open_event_names: str
     home_event_names: str
     feature_event_names: str
+    ga4_stream_id: str = ""
+    package_name: str = ""
 
 
 def get_credentials():
@@ -236,6 +238,270 @@ def read_apps_config() -> list[AppConfig]:
     return apps
 
 
+def list_accessible_ga4_property_summaries() -> list[dict]:
+    """List every GA4 property visible to the service account."""
+    base = str(config.ga4_admin_api_base).rstrip("/")
+    url = f"{base}/accountSummaries"
+    params = {"pageSize": 200}
+    properties: list[dict] = []
+
+    while True:
+        response = get_analytics_admin_session().get(url, params=params, timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"GA4 Admin accountSummaries error {response.status_code}: "
+                f"{response.text}"
+            )
+        payload = response.json()
+        for account in payload.get("accountSummaries", []) or []:
+            account_name = str(account.get("displayName", "")).strip()
+            for item in account.get("propertySummaries", []) or []:
+                property_resource = str(item.get("property", "")).strip()
+                property_id = property_resource.rsplit("/", 1)[-1]
+                if not property_id:
+                    continue
+                properties.append(
+                    {
+                        "property_id": property_id,
+                        "property_name": str(item.get("displayName", "")).strip(),
+                        "property_type": str(item.get("propertyType", "")).strip(),
+                        "account_name": account_name,
+                    }
+                )
+
+        token = str(payload.get("nextPageToken", "") or "").strip()
+        if not token:
+            break
+        params["pageToken"] = token
+
+    # Account summaries should already be unique, but keep the result stable.
+    deduped: dict[str, dict] = {}
+    for item in properties:
+        deduped[item["property_id"]] = item
+    return sorted(
+        deduped.values(),
+        key=lambda item: (item.get("property_name", "").lower(), item["property_id"]),
+    )
+
+
+def list_ga4_data_streams(property_id: str) -> list[dict]:
+    """List all data streams for one accessible GA4 property."""
+    base = str(config.ga4_admin_api_base).rstrip("/")
+    url = f"{base}/properties/{property_id}/dataStreams"
+    params = {"pageSize": 200}
+    streams: list[dict] = []
+
+    while True:
+        response = get_analytics_admin_session().get(url, params=params, timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"GA4 Admin dataStreams error {response.status_code}: "
+                f"{response.text}"
+            )
+        payload = response.json()
+        streams.extend(payload.get("dataStreams", []) or [])
+        token = str(payload.get("nextPageToken", "") or "").strip()
+        if not token:
+            break
+        params["pageToken"] = token
+
+    return streams
+
+
+def list_accessible_firebase_projects() -> list[dict]:
+    """List Firebase projects visible to the same service account."""
+    base = str(
+        getattr(
+            config,
+            "firebase_management_api_base",
+            "https://firebase.googleapis.com/v1beta1",
+        )
+    ).rstrip("/")
+    url = f"{base}/projects"
+    params = {"pageSize": 100}
+    projects: list[dict] = []
+
+    while True:
+        response = get_notification_api_session().get(url, params=params, timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Firebase projects.list error {response.status_code}: "
+                f"{response.text}"
+            )
+        payload = response.json()
+        projects.extend(payload.get("results", []) or [])
+        token = str(payload.get("nextPageToken", "") or "").strip()
+        if not token:
+            break
+        params["pageToken"] = token
+
+    return projects
+
+
+def build_accessible_firebase_app_indexes() -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """Index Firebase Android apps by Firebase App ID and package name."""
+    by_app_id: dict[str, dict] = {}
+    by_package: dict[str, list[dict]] = {}
+
+    try:
+        projects = list_accessible_firebase_projects()
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(
+            "FIREBASE DISCOVERY "
+            f"{status}: {error_text}. GA4 apps will still be processed, "
+            "but Firebase project details may be blank."
+        )
+        return by_app_id, by_package
+
+    for project in projects:
+        project_id = str(project.get("projectId", "") or "").strip()
+        project_number = str(project.get("projectNumber", "") or "").strip()
+        project_resource = str(project.get("name", "") or "").strip()
+        project_identifier = (
+            project_id
+            or project_number
+            or project_resource.rsplit("/", 1)[-1]
+        )
+        if not project_identifier:
+            continue
+
+        try:
+            android_apps = list_firebase_android_apps(project_identifier)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(
+                f"FIREBASE APP DISCOVERY {status} for {project_identifier}: "
+                f"{error_text}"
+            )
+            continue
+
+        for firebase_app in android_apps:
+            record = {
+                "project": project,
+                "app": firebase_app,
+            }
+            firebase_app_id = str(firebase_app.get("appId", "") or "").strip()
+            package_name = str(firebase_app.get("packageName", "") or "").strip()
+            if firebase_app_id:
+                by_app_id[firebase_app_id] = record
+            if package_name:
+                by_package.setdefault(package_name.lower(), []).append(record)
+
+    return by_app_id, by_package
+
+
+def discover_apps_from_service_account() -> list[AppConfig]:
+    """Discover every Android GA4 app the service account can read.
+
+    GA4 property and stream metadata come from the Analytics Admin API.
+    Firebase project/app metadata come from the Firebase Management API when
+    the same service account also has Firebase project access. Apps Config is
+    not used as the source of the app list.
+    """
+    firebase_by_app_id, firebase_by_package = build_accessible_firebase_app_indexes()
+    discovered: list[AppConfig] = []
+
+    for property_item in list_accessible_ga4_property_summaries():
+        property_id = property_item["property_id"]
+        property_name = property_item.get("property_name", "")
+        try:
+            streams = list_ga4_data_streams(property_id)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(
+                f"GA4 STREAM DISCOVERY {status} for {property_name} / "
+                f"{property_id}: {error_text}"
+            )
+            continue
+
+        for stream in streams:
+            android = stream.get("androidAppStreamData", {}) or {}
+            if not android:
+                continue
+
+            stream_resource = str(stream.get("name", "") or "").strip()
+            stream_id = stream_resource.rsplit("/", 1)[-1]
+            stream_name = str(stream.get("displayName", "") or "").strip()
+            firebase_app_id = str(android.get("firebaseAppId", "") or "").strip()
+            package_name = str(android.get("packageName", "") or "").strip()
+
+            firebase_record = firebase_by_app_id.get(firebase_app_id)
+            if firebase_record is None and package_name:
+                package_matches = firebase_by_package.get(package_name.lower(), [])
+                if len(package_matches) == 1:
+                    firebase_record = package_matches[0]
+
+            firebase_project_id = ""
+            firebase_project_name = ""
+            firebase_display_name = ""
+            if firebase_record:
+                project = firebase_record.get("project", {}) or {}
+                firebase_app = firebase_record.get("app", {}) or {}
+                firebase_project_id = str(
+                    project.get("projectId", "")
+                    or firebase_app.get("projectId", "")
+                    or ""
+                ).strip()
+                firebase_project_name = str(project.get("displayName", "") or "").strip()
+                firebase_display_name = str(firebase_app.get("displayName", "") or "").strip()
+                firebase_app_id = firebase_app_id or str(firebase_app.get("appId", "") or "").strip()
+                package_name = package_name or str(firebase_app.get("packageName", "") or "").strip()
+
+            app_name = stream_name or firebase_display_name or property_name or package_name
+            discovered.append(
+                AppConfig(
+                    app_name=app_name,
+                    property_id=property_id,
+                    home_screen_name=str(
+                        getattr(config, "default_home_screen_name", "Home")
+                    ),
+                    screen_field=str(
+                        getattr(config, "default_screen_field", "unifiedScreenName")
+                    ),
+                    firebase_project_id=firebase_project_id,
+                    firebase_project_name=firebase_project_name,
+                    firebase_app_id=firebase_app_id,
+                    time_capping_parameter=str(
+                        getattr(config, "time_capping_parameter", "")
+                    ),
+                    iap_screen_parameter=str(
+                        getattr(config, "iap_screen_parameter", "")
+                    ),
+                    app_open_event_names=str(
+                        getattr(config, "app_open_event_names", "app_open")
+                    ),
+                    home_event_names="",
+                    feature_event_names=str(
+                        getattr(config, "feature_event_names", "")
+                    ),
+                    ga4_stream_id=stream_id,
+                    package_name=package_name,
+                )
+            )
+
+    # Avoid duplicates and make processing order deterministic.
+    unique: dict[tuple[str, str, str, str], AppConfig] = {}
+    for app in discovered:
+        key = (
+            app.property_id,
+            app.ga4_stream_id,
+            app.firebase_app_id,
+            app.package_name,
+        )
+        unique[key] = app
+
+    apps = sorted(
+        unique.values(),
+        key=lambda app: (app.app_name.lower(), app.property_id, app.ga4_stream_id),
+    )
+    if not apps:
+        raise SystemExit(
+            "No accessible Android GA4 data streams were found for this service account."
+        )
+    return apps
+
+
 def resolve_ga4_date(value: str) -> str:
     value = str(value).strip()
     today = datetime.now(ZoneInfo(config.timezone)).date()
@@ -343,6 +609,8 @@ def get_analytics_admin_session():
 
 
 def fetch_ga4_package_name(app: AppConfig) -> str:
+    if app.package_name:
+        return app.package_name
     if not config.fetch_package_name:
         return ""
     cache_key = f"{app.property_id}|{app.firebase_app_id}"
@@ -429,6 +697,22 @@ def and_filter(expressions: list[FilterExpression]) -> FilterExpression:
     return FilterExpression(and_group=FilterExpressionList(expressions=expressions))
 
 
+def report_dimension_filter_kwargs(
+    app: AppConfig,
+    base_filter: FilterExpression | None = None,
+) -> dict:
+    """Return RunReportRequest kwargs scoped to the discovered GA4 stream."""
+    expressions: list[FilterExpression] = []
+    if app.ga4_stream_id:
+        expressions.append(exact_filter("streamId", app.ga4_stream_id))
+    if base_filter is not None:
+        expressions.append(base_filter)
+    if not expressions:
+        return {}
+    expression = expressions[0] if len(expressions) == 1 else and_filter(expressions)
+    return {"dimension_filter": expression}
+
+
 def date_order() -> OrderBy:
     return OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))
 
@@ -475,6 +759,7 @@ def run_time_analysis_report(app: AppConfig) -> dict[str, list[dict]]:
                 Metric(name="engagementRate"),
             ],
             order_bys=[date_order(), metric_order("activeUsers")],
+            **report_dimension_filter_kwargs(app),
             keep_empty_rows=False,
             limit=page_size,
             offset=offset,
@@ -522,7 +807,10 @@ def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, 
         date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
         dimensions=[Dimension(name="date"), Dimension(name="eventName")],
         metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-        dimension_filter=in_list_filter("eventName", event_names),
+        **report_dimension_filter_kwargs(
+            app,
+            in_list_filter("eventName", event_names),
+        ),
         order_bys=[date_order()],
         keep_empty_rows=False,
         limit=100000,
@@ -545,7 +833,15 @@ def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
         date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
         dimensions=[Dimension(name="date")],
         metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-        dimension_filter=and_filter([exact_filter("eventName", "screen_view"), contains_filter(app.screen_field, app.home_screen_name)]),
+        **report_dimension_filter_kwargs(
+            app,
+            and_filter(
+                [
+                    exact_filter("eventName", "screen_view"),
+                    contains_filter(app.screen_field, app.home_screen_name),
+                ]
+            ),
+        ),
         order_bys=[date_order()],
         keep_empty_rows=True,
         limit=100000,
@@ -636,6 +932,7 @@ def run_retention_report(
                         end_offset=max(RETENTION_DAY_OFFSETS),
                     ),
                 ),
+                **report_dimension_filter_kwargs(app),
                 keep_empty_rows=True,
                 limit=page_size,
                 offset=offset,
@@ -864,6 +1161,7 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
                 Dimension(name="audienceName"),
             ],
             metrics=[Metric(name="totalUsers")],
+            **report_dimension_filter_kwargs(app),
             order_bys=[metric_order("totalUsers")],
             keep_empty_rows=False,
             limit=page_size,
@@ -978,6 +1276,7 @@ def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str
                 Metric(name="engagementRate"),
             ],
             order_bys=[date_order(), metric_order("activeUsers")],
+            **report_dimension_filter_kwargs(app),
             limit=page_size,
             offset=offset,
         )
@@ -1040,7 +1339,7 @@ def get_remote_config_session():
 def get_firebase_remote_config_template(firebase_project_id: str) -> dict:
     project_id = str(firebase_project_id or "").strip()
     if not project_id:
-        raise ValueError("Firebase Project ID is empty in Apps Config.")
+        raise ValueError("Firebase Project ID could not be discovered for this app.")
     if project_id in remote_config_template_cache:
         return remote_config_template_cache[project_id]
     project_path = f"projects/{project_id}"
@@ -1244,7 +1543,7 @@ def get_remote_config_ab_rows(app: AppConfig) -> dict:
             {
                 "name": app.time_capping_parameter or config.time_capping_parameter,
                 "condition": "",
-                "value": "Missing Firebase Project ID in Apps Config.",
+                "value": "Firebase Project ID was not discovered or is not accessible.",
                 "fetch_percent": "",
                 "last_published": "",
             }
@@ -1253,7 +1552,7 @@ def get_remote_config_ab_rows(app: AppConfig) -> dict:
             {
                 "name": app.iap_screen_parameter or config.iap_screen_parameter,
                 "condition": "",
-                "value": "Missing Firebase Project ID in Apps Config.",
+                "value": "Firebase Project ID was not discovered or is not accessible.",
                 "fetch_percent": "",
                 "last_published": "",
             }
@@ -1451,20 +1750,20 @@ def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
     configured_app_id = str(app.firebase_app_id or "").strip()
 
     if not project_identifier:
-        raise ValueError("Firebase Project ID is empty in Apps Config.")
+        raise ValueError("Firebase Project ID could not be discovered for this app.")
 
     # Preferred path: no Firebase Management API request.
     if looks_like_firebase_app_id(configured_app_id):
-        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
+        return project_identifier, configured_app_id, "Using discovered Firebase App ID."
 
     # Fallback path for an empty ID or package-name value.
     android_apps = list_firebase_android_apps(project_identifier)
     selected = choose_firebase_android_app(app, android_apps)
     if selected:
         note = (
-            "Firebase App ID was empty; auto-resolved from Firebase Android apps list."
+            "Firebase App ID was not present in the GA4 stream; auto-resolved from Firebase Android apps list."
             if not configured_app_id
-            else f"Firebase App ID resolved from Apps Config value '{configured_app_id}'."
+            else f"Firebase App ID resolved from discovered value '{configured_app_id}'."
         )
         return (
             selected.get("projectId") or project_identifier,
@@ -1679,7 +1978,16 @@ FCM_COLUMNS = [
 
 
 def build_output_headers() -> list[str]:
-    headers = ["Package Name", "Date"]
+    headers = [
+        "App Name",
+        "GA4 Property ID",
+        "GA4 Stream ID",
+        "Firebase Project ID",
+        "Firebase Project Name",
+        "Firebase App ID",
+        "Package Name",
+        "Date",
+    ]
     headers.extend(FCM_COLUMNS)
 
     headers.extend(
@@ -1942,6 +2250,12 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
         for index in range(row_count):
             output_row = {header: "" for header in OUTPUT_HEADERS}
+            output_row["App Name"] = app.app_name
+            output_row["GA4 Property ID"] = app.property_id
+            output_row["GA4 Stream ID"] = app.ga4_stream_id
+            output_row["Firebase Project ID"] = app.firebase_project_id
+            output_row["Firebase Project Name"] = app.firebase_project_name
+            output_row["Firebase App ID"] = app.firebase_app_id
             output_row["Package Name"] = package_name
             output_row["Date"] = report_date
 
@@ -1978,10 +2292,10 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
 
 def main():
-    print("Reading app list from Apps Config sheet...")
-    apps = read_apps_config()
+    print("Discovering all Android GA4 apps accessible to the service account...")
+    apps = discover_apps_from_service_account()
     report_dates = get_report_dates()
-    print(f"Total enabled apps found: {len(apps)}")
+    print(f"Total accessible Android apps found: {len(apps)}")
     print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
 
     rows = [OUTPUT_HEADERS]
