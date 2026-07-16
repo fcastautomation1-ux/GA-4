@@ -3,73 +3,62 @@ name: GA4 to Google Sheets
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ga4-to-google-sheets
+  cancel-in-progress: false
+
 jobs:
   ga4-to-sheets:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install packages
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Run GA4 script
+      - name: Run GA4 export
         env:
           GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-          # Date Range
           START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
           END_DATE: ${{ vars.END_DATE || 'today' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
 
-          # Output Sheet
           MERGED_SHEET: ${{ vars.MERGED_SHEET || 'GA4 Merged Data' }}
 
-          # GA4 Defaults
-          DEFAULT_HOME_SCREEN_NAME: ${{ vars.DEFAULT_HOME_SCREEN_NAME || 'MainActivity' }}
-          DEFAULT_SCREEN_FIELD: ${{ vars.DEFAULT_SCREEN_FIELD || 'unifiedPagePathScreen' }}
-
-          # Events
           APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
-          HOME_EVENT_NAMES: ${{ vars.HOME_EVENT_NAMES || '' }}
-          FEATURE_EVENT_NAMES: ${{ vars.FEATURE_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
-
-          # Personalized Data
+          HOME_EVENT_NAMES: ${{ vars.HOME_EVENT_NAMES }}
+          HOME_SCREEN_OVERRIDES_JSON: ${{ vars.HOME_SCREEN_OVERRIDES_JSON || '{}' }}
+          FEATURE_EVENT_NAMES: ${{ vars.FEATURE_EVENT_NAMES || vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
 
-          # Firebase Remote Config
           TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
           IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
           IAP_SCREEN_PARAMETER_KEYWORDS: ${{ vars.IAP_SCREEN_PARAMETER_KEYWORDS || 'iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen' }}
-
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
-
           FIREBASE_REMOTE_CONFIG_API_BASE: ${{ vars.FIREBASE_REMOTE_CONFIG_API_BASE || 'https://firebaseremoteconfig.googleapis.com/v1' }}
-
           FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
 
-          # Firebase FCM Delivery
           FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
-
           FIREBASE_MANAGEMENT_API_BASE: ${{ vars.FIREBASE_MANAGEMENT_API_BASE || 'https://firebase.googleapis.com/v1beta1' }}
-
           FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
 
-          # GA4 Admin API Discovery
           FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
-
-          GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
-
-          GA4_ADMIN_AUDIENCE_API_BASE: ${{ vars.GA4_ADMIN_AUDIENCE_API_BASE || 'https://analyticsadmin.googleapis.com/v1alpha' }}
-
-          # Cleanup
           CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
+          GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
+          GA4_ADMIN_AUDIENCE_API_BASE: ${{ vars.GA4_ADMIN_AUDIENCE_API_BASE || 'https://analyticsadmin.googleapis.com/v1alpha' }}
 
         run: python ga4_to_sheets.py
