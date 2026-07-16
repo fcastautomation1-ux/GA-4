@@ -1,5 +1,4 @@
 google-analytics-data>=0.23.0,<1
-google-api-python-client>=2.170.0,<3
+google-cloud-bigquery>=3.38.0,<4
 google-auth>=2.40.0,<3
-google-auth-httplib2>=0.2.0,<1
 requests>=2.32.0,<3
