@@ -1,4 +1,4 @@
-name: GA4 to BigQuery
+name: GA4 and Firebase to BigQuery
 
 on:
   workflow_dispatch:
@@ -7,11 +7,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ga4-to-bigquery
+  group: ga4-firebase-to-bigquery
   cancel-in-progress: false
 
 jobs:
-  ga4-to-bigquery:
+  ga4-firebase-to-bigquery:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -26,44 +26,51 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Export GA4 data to BigQuery
+      - name: Export GA4 and Firebase data to BigQuery
         env:
+          # Required GitHub Actions secret containing the complete
+          # Google service-account JSON object.
           GA4_SERVICE_ACCOUNT_JSON: ${{ secrets.GA4_SERVICE_ACCOUNT_JSON }}
 
           # Leave BIGQUERY_PROJECT_ID empty to use project_id from the
-          # service-account JSON. Project IDs are not secrets.
+          # service-account JSON.
           BIGQUERY_PROJECT_ID: ${{ vars.BIGQUERY_PROJECT_ID }}
-          BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET || 'ga4_reporting' }}
-          BIGQUERY_TABLE: ${{ vars.BIGQUERY_TABLE || 'ga4_merged_data' }}
+          BIGQUERY_DATASET_ID: ${{ vars.BIGQUERY_DATASET_ID || 'ga4_firebase' }}
+          BIGQUERY_TABLE_ID: ${{ vars.BIGQUERY_TABLE_ID || 'all_apps_analytics' }}
           BIGQUERY_LOCATION: ${{ vars.BIGQUERY_LOCATION || 'US' }}
           BIGQUERY_WRITE_DISPOSITION: ${{ vars.BIGQUERY_WRITE_DISPOSITION || 'WRITE_TRUNCATE' }}
-          BIGQUERY_CREATE_DATASET: ${{ vars.BIGQUERY_CREATE_DATASET || 'true' }}
 
           START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
-          END_DATE: ${{ vars.END_DATE || 'today' }}
+          END_DATE: ${{ vars.END_DATE || 'yesterday' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
 
-          APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
-          HOME_EVENT_NAMES: ${{ vars.HOME_EVENT_NAMES }}
-          HOME_SCREEN_OVERRIDES_JSON: ${{ vars.HOME_SCREEN_OVERRIDES_JSON || '{}' }}
-          FEATURE_EVENT_NAMES: ${{ vars.FEATURE_EVENT_NAMES || vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
+          DEFAULT_HOME_SCREEN_NAME: ${{ vars.DEFAULT_HOME_SCREEN_NAME || 'MainActivity' }}
+          DEFAULT_SCREEN_FIELD: ${{ vars.DEFAULT_SCREEN_FIELD || 'unifiedPagePathScreen' }}
+          SCREEN_FIELD_CANDIDATES: ${{ vars.SCREEN_FIELD_CANDIDATES || 'unifiedPagePathScreen,unifiedScreenName,unifiedScreenClass,screenName,screenClass' }}
+          HOME_SCREEN_KEYWORDS: ${{ vars.HOME_SCREEN_KEYWORDS || 'home,main,dashboard,landing,start' }}
+          APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
+          HOME_EVENT_KEYWORDS: ${{ vars.HOME_EVENT_KEYWORDS || 'home,main,dashboard,landing' }}
 
-          TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
-          IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
+          TIME_CAPPING_PARAMETER_KEYWORDS: ${{ vars.TIME_CAPPING_PARAMETER_KEYWORDS || 'ad_time_capping,time_capping,ad_capping,interstitial_time_capping,app_open_time_capping,capping' }}
           IAP_SCREEN_PARAMETER_KEYWORDS: ${{ vars.IAP_SCREEN_PARAMETER_KEYWORDS || 'iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen' }}
+          REMOTE_PARAMETER_LIMIT: ${{ vars.REMOTE_PARAMETER_LIMIT || '20' }}
+
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
           FIREBASE_REMOTE_CONFIG_API_BASE: ${{ vars.FIREBASE_REMOTE_CONFIG_API_BASE || 'https://firebaseremoteconfig.googleapis.com/v1' }}
-          FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
-
-          FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
           FIREBASE_MANAGEMENT_API_BASE: ${{ vars.FIREBASE_MANAGEMENT_API_BASE || 'https://firebase.googleapis.com/v1beta1' }}
+          FCM_DATA_API_BASE: ${{ vars.FCM_DATA_API_BASE || 'https://fcmdata.googleapis.com/v1beta1' }}
           FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
 
-          FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
           GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
           GA4_ADMIN_AUDIENCE_API_BASE: ${{ vars.GA4_ADMIN_AUDIENCE_API_BASE || 'https://analyticsadmin.googleapis.com/v1alpha' }}
 
-        run: python ga4_to_bigquery.py
+          REQUEST_TIMEOUT_SECONDS: ${{ vars.REQUEST_TIMEOUT_SECONDS || '45' }}
+          MAX_RETRIES: ${{ vars.MAX_RETRIES || '5' }}
+          CONTINUE_ON_ERROR: ${{ vars.CONTINUE_ON_ERROR || 'true' }}
+
+        run: python ga4_firebase_to_bigquery.py
