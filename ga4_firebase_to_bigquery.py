@@ -1317,8 +1317,8 @@ class Pipeline:
             )
             summary_rows.append(
                 {
-                    "Audien Name": audience_name,
-                    "Events Name": definition.get("events_name", ""),
+                    "Audience_Name": audience_name,
+                    "Events_Name": definition.get("events_name", ""),
                     "Countries": definition.get("countries", ""),
                     "Total_Users": to_number(totals_by_key.get(key, 0)),
                     "_create_time": definition.get("create_time", ""),
@@ -1327,7 +1327,7 @@ class Pipeline:
         summary_rows.sort(
             key=lambda item: (
                 str(item.get("_create_time", "")),
-                str(item.get("Audien Name", "")).lower(),
+                str(item.get("Audience_Name", "")).lower(),
             ),
             reverse=True,
         )
@@ -1812,8 +1812,8 @@ class Pipeline:
 
     @staticmethod
     def set_audience_columns(row: dict[str, Any], item: Mapping[str, Any]) -> None:
-        row["Audien Name"] = item.get("Audien Name", "")
-        row["Events Name"] = item.get("Events Name", "")
+        row["Audience_Name"] = item.get("Audience_Name", "")
+        row["Events_Name"] = item.get("Events_Name", "")
         row["Countries"] = item.get("Countries", "")
         row["Total_Users"] = item.get("Total_Users", 0)
 
@@ -2034,7 +2034,7 @@ class Pipeline:
 
             for index in range(row_count):
                 row: dict[str, Any] = {header: None for header in OUTPUT_HEADERS}
-                row["Package Name"] = app.package_name
+                row["Package_Name"] = app.package_name
                 row["Date"] = report_date
 
                 # Date-level metrics appear once per package/date. The other
