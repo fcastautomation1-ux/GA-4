@@ -135,9 +135,56 @@ def load_config() -> Config:
             "TIME_CAPPING_PARAMETER_KEYWORDS",
             "ad_time_capping,time_capping,ad_capping,interstitial_time_capping,app_open_time_capping,capping",
         ),
-        iap_screen_parameter_keywords=optional_env(
+       iap_screen_parameter_keywords=optional_env(
             "IAP_SCREEN_PARAMETER_KEYWORDS",
-            "iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen",
+             (
+        "iap_screen,"
+        "iap_screen_variant,"
+        "iap_paywall,"
+        "iap,"
+        "paywall,"
+        "premium_visibility,"
+        "premium,"
+        "premium_screen,"
+        "premium_dialog,"
+        "premium_popup,"
+        "premium_modal,"
+        "premium_offer,"
+        "premium_plan,"
+        "subscription,"
+        "subscription_screen,"
+        "subscription_dialog,"
+        "subscription_popup,"
+        "subscribe,"
+        "subscribe_screen,"
+        "purchase,"
+        "purchase_screen,"
+        "purchase_flow,"
+        "purchase_dialog,"
+        "checkout,"
+        "billing,"
+        "billing_screen,"
+        "pricing,"
+        "pricing_screen,"
+        "price_screen,"
+        "plans,"
+        "plan_screen,"
+        "offers,"
+        "offers_screen,"
+        "upgrade,"
+        "upgrade_screen,"
+        "pro_screen,"
+        "trial,"
+        "trial_screen,"
+        "free_trial,"
+        "membership,"
+        "entitlement,"
+        "show_premium,"
+        "show_paywall,"
+        "enable_premium,"
+        "enable_paywall"
+    ),
+),
         ),
         remote_parameter_limit=max(optional_int_env("REMOTE_PARAMETER_LIMIT", 20), 1),
         remote_config_namespace=optional_env("REMOTE_CONFIG_NAMESPACE", "firebase"),
