@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -2077,6 +2078,8 @@ class Pipeline:
 
 
 class BigQueryWriter:
+    """Stage all rows first, then publish the complete table in one copy job."""
+
     def __init__(
         self,
         config: Config,
@@ -2099,27 +2102,50 @@ class BigQueryWriter:
             f"{project_id}.{config.bigquery_dataset_id}.{config.bigquery_table_id}"
         )
 
+        # A unique staging table allows every app to be processed without
+        # changing the live target table during the run.
+        run_suffix = (
+            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid4().hex[:8]}"
+        )
+        self.staging_table_name = (
+            f"{config.bigquery_table_id}__staging_{run_suffix}"
+        )
+        self.staging_table_ref = self.dataset_ref.table(self.staging_table_name)
+        self.staging_table_id = (
+            f"{project_id}.{config.bigquery_dataset_id}.{self.staging_table_name}"
+        )
+
+    @staticmethod
+    def _new_table(
+        table_ref: bigquery.TableReference,
+        description: str,
+    ) -> bigquery.Table:
+        table = bigquery.Table(table_ref, schema=BIGQUERY_SCHEMA)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field="Date",
+        )
+        table.description = description
+        return table
+
     def prepare(self) -> None:
+        """Create only the staging table; leave the live table unchanged."""
         dataset = bigquery.Dataset(self.dataset_ref)
         dataset.location = self.config.bigquery_location
         self.client.create_dataset(dataset, exists_ok=True)
 
-        if self.config.bigquery_write_disposition == "WRITE_TRUNCATE":
-            self.client.delete_table(self.table_ref, not_found_ok=True)
-
-        try:
-            self.client.get_table(self.table_ref)
-        except NotFound:
-            table = bigquery.Table(self.table_ref, schema=BIGQUERY_SCHEMA)
-            table.time_partitioning = bigquery.TimePartitioning(
-                type_=bigquery.TimePartitioningType.DAY,
-                field="Date",
-            )
-            table.description = (
-                "GA4 and Firebase analytics for all accessible Android app streams. "
-                "Generated without an Apps Config spreadsheet."
-            )
-            self.client.create_table(table)
+        self.client.delete_table(self.staging_table_ref, not_found_ok=True)
+        staging_table = self._new_table(
+            self.staging_table_ref,
+            "Temporary staging table for an atomic GA4/Firebase refresh.",
+        )
+        self.client.create_table(staging_table)
+        LOGGER.info("Created staging table %s", self.staging_table_id)
+        LOGGER.info(
+            "Live table %s will remain unchanged until every app is processed",
+            self.table_id,
+        )
 
     @staticmethod
     def normalize_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2143,6 +2169,7 @@ class BigQueryWriter:
         *,
         chunk_size: int = 5000,
     ) -> int:
+        """Append rows to staging only; this never changes the live table."""
         buffer: list[dict[str, Any]] = []
         total = 0
 
@@ -2157,15 +2184,19 @@ class BigQueryWriter:
             )
             load_job = self.client.load_table_from_json(
                 list(buffer),
-                self.table_ref,
+                self.staging_table_ref,
                 job_config=job_config,
                 location=self.config.bigquery_location,
             )
             load_job.result()
             if load_job.errors:
-                raise RuntimeError(f"BigQuery load errors: {load_job.errors}")
+                raise RuntimeError(f"BigQuery staging load errors: {load_job.errors}")
             total += len(buffer)
-            LOGGER.info("Loaded %d rows into %s", total, self.table_id)
+            LOGGER.info(
+                "Staged %d row(s) in this app batch into %s",
+                total,
+                self.staging_table_id,
+            )
             buffer.clear()
 
         for row in rows:
@@ -2175,6 +2206,36 @@ class BigQueryWriter:
         flush()
         return total
 
+    def publish(self) -> None:
+        """Atomically replace the live table after all staging loads succeed."""
+        job_config = bigquery.CopyJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+        )
+        copy_job = self.client.copy_table(
+            self.staging_table_ref,
+            self.table_ref,
+            job_config=job_config,
+            location=self.config.bigquery_location,
+        )
+        copy_job.result()
+        if copy_job.errors:
+            raise RuntimeError(f"BigQuery publish errors: {copy_job.errors}")
+        LOGGER.info(
+            "Published the complete staging table to %s in one final update",
+            self.table_id,
+        )
+
+    def cleanup(self) -> None:
+        try:
+            self.client.delete_table(self.staging_table_ref, not_found_ok=True)
+            LOGGER.info("Removed staging table %s", self.staging_table_id)
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not remove staging table %s: %s",
+                self.staging_table_id,
+                exc,
+            )
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -2209,24 +2270,45 @@ def main() -> int:
         writer.prepare()
 
         total_rows = 0
-        for app in apps:
-            try:
-                pipeline.infer_ga4_app_configuration(app)
-                app_rows = pipeline.build_rows_for_app(app, report_dates)
-                total_rows += writer.write_rows(app_rows)
-            except Exception as exc:
-                LOGGER.exception(
-                    "App failed: %s | property=%s | stream=%s | %s",
-                    app.package_name,
-                    app.property_id,
-                    app.ga4_stream_id,
-                    exc,
+        failed_apps: list[str] = []
+        try:
+            for app in apps:
+                try:
+                    pipeline.infer_ga4_app_configuration(app)
+                    app_rows = pipeline.build_rows_for_app(app, report_dates)
+                    total_rows += writer.write_rows(app_rows)
+                except Exception as exc:
+                    failed_apps.append(
+                        f"{app.package_name} ({app.property_id}/{app.ga4_stream_id})"
+                    )
+                    LOGGER.exception(
+                        "App failed: %s | property=%s | stream=%s | %s",
+                        app.package_name,
+                        app.property_id,
+                        app.ga4_stream_id,
+                        exc,
+                    )
+                    if not config.continue_on_error:
+                        raise
+
+            if failed_apps:
+                raise RuntimeError(
+                    f"{len(failed_apps)} app(s) failed. The live table was not "
+                    "updated. Failed apps: " + "; ".join(failed_apps[:20])
                 )
-                if not config.continue_on_error:
-                    raise
+            if total_rows <= 0:
+                raise RuntimeError(
+                    "No rows were generated. The live table was not updated."
+                )
+
+            # Only this final copy changes the live table. Until this point, all
+            # data exists exclusively in the staging table.
+            writer.publish()
+        finally:
+            writer.cleanup()
 
         LOGGER.info(
-            "Completed: %d rows written to %s",
+            "Completed: %d rows published together to %s",
             total_rows,
             writer.table_id,
         )
