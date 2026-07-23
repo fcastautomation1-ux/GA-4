@@ -2197,13 +2197,18 @@ class BigQueryWriter:
 
         quoted_columns = ", ".join(f"`{column}`" for column in required_columns)
         sql = f"""
-        INSERT INTO `{self.staging_table_id}` ({quoted_columns})
         SELECT {quoted_columns}
         FROM `{self.table_id}`
         WHERE Date BETWEEN @preserve_start AND @preserve_end
         """
 
+        # BigQuery Sandbox does not allow DML statements such as INSERT.
+        # Use a normal SELECT query and save its results directly into the
+        # staging table with WRITE_APPEND instead.
         job_config = bigquery.QueryJobConfig(
+            destination=self.staging_table_ref,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
             query_parameters=[
                 bigquery.ScalarQueryParameter(
                     "preserve_start",
@@ -2215,15 +2220,19 @@ class BigQueryWriter:
                     "DATE",
                     preserve_end,
                 ),
-            ]
+            ],
         )
         query_job = self.client.query(
             sql,
             job_config=job_config,
             location=self.config.bigquery_location,
         )
-        query_job.result()
-        preserved_rows = int(query_job.num_dml_affected_rows or 0)
+        query_result = query_job.result()
+        if query_job.errors:
+            raise RuntimeError(
+                f"BigQuery history-preservation query errors: {query_job.errors}"
+            )
+        preserved_rows = int(query_result.total_rows or 0)
 
         LOGGER.info(
             "Preserved %d existing row(s) for %s through %s",
